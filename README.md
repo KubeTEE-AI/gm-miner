@@ -251,6 +251,9 @@ incompatible explicit version/image selections fail at this preflight too.
 Deploy creates a Phala Cloud CVM, verifies the deployed image hashes against the registry's
 approved versions, and registers the worker — all in one step.
 
+`gmcli deploy` and `gmcli worker add` support the registry-attested `tdx.small` (1 vCPU / 2 GiB)
+and `tdx.medium` (2 vCPU / 4 GiB, the default) sizes.
+
 **You need a funded Phala Cloud account.** Sign up at <https://cloud.phala.network> and create
 an API key (Dashboard → API Keys). gmcli will prompt for it on the first deploy and save it for
 later runs. Pass `--phala-api-key <key>` or set `PHALA_API_KEY` to skip the prompt.

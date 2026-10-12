@@ -220,6 +220,9 @@ the miner advertises opaque slot ids for them — see
 
 **2. Deploy, so the key reaches a worker.**
 
+Choose the registry-attested `tdx.small` (1 vCPU / 2 GiB) or `tdx.medium` (2 vCPU / 4 GiB,
+the default) size for the worker.
+
 ```sh
 gmcli deploy
 ```

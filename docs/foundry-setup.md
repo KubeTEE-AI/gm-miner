@@ -247,6 +247,9 @@ honestly named catalog deployment, printing the echoed `model` against its name.
 
 ## 8. Deploy and validate transport
 
+The miner CVM can use the registry-attested `tdx.small` (1 vCPU / 2 GiB) or `tdx.medium`
+(2 vCPU / 4 GiB, the default) size.
+
 ```sh
 gmcli deploy
 ```
