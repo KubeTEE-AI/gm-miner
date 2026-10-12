@@ -577,6 +577,39 @@ enum Command {
     },
 }
 
+/// Phala CVM sizes with OS measurement references in the registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PhalaInstanceType {
+    Small,
+    Medium,
+}
+
+impl PhalaInstanceType {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "tdx.small",
+            Self::Medium => "tdx.medium",
+        }
+    }
+}
+
+impl std::str::FromStr for PhalaInstanceType {
+    type Err = std::io::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "tdx.small" => Ok(Self::Small),
+            "tdx.medium" => Ok(Self::Medium),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported Phala instance type `{value}`; supported values are `tdx.small` and `tdx.medium` because the registry attests only these sizes"
+                ),
+            )),
+        }
+    }
+}
+
 /// Deploy flags shared by `gmcli deploy` (worker #1) and
 /// `gmcli worker add` (further capacity). Both submit one Phala CVM via
 /// the same plumbing; they differ only in which registry endpoint records
@@ -621,9 +654,17 @@ pub(crate) struct DeployFlags {
     #[arg(long, env = "IMAGE_TAG", default_value = "v0.1.4")]
     pub(crate) image_tag: String,
 
-    /// Phala Cloud instance type for the CVM.
-    #[arg(long, env = "PHALA_INSTANCE_TYPE", default_value = "tdx.medium")]
-    pub(crate) instance_type: String,
+    /// Phala Cloud CVM size. Supported values are `tdx.small` and `tdx.medium`;
+    /// the registry attests only these sizes.
+    #[arg(
+        long,
+        env = "PHALA_INSTANCE_TYPE",
+        default_value = "tdx.medium",
+        value_name = "INSTANCE_TYPE",
+        value_parser = clap::value_parser!(PhalaInstanceType),
+        help = "Phala CVM size (tdx.small or tdx.medium); the registry attests only these sizes"
+    )]
+    pub(crate) instance_type: PhalaInstanceType,
 
     /// Disk size for the CVM (with unit, e.g. `40G`).
     #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
@@ -1783,6 +1824,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn clap_accepts_only_the_registry_attested_instance_types() {
+        let deploy = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "deploy",
+            "--instance-type",
+            "tdx.small",
+        ])
+        .unwrap();
+        assert!(matches!(
+            deploy.command,
+            Command::Deploy { flags } if flags.instance_type.as_str() == "tdx.small"
+        ));
+
+        let worker_add = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "worker",
+            "add",
+            "--instance-type",
+            "tdx.medium",
+        ])
+        .unwrap();
+        assert!(matches!(
+            worker_add.command,
+            Command::Worker {
+                command: WorkerCommand::Add { flags }
+            } if flags.instance_type.as_str() == "tdx.medium"
+        ));
+    }
+
+    #[test]
+    fn clap_rejects_unattested_instance_type_with_registry_context() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "deploy",
+            "--instance-type",
+            "tdx.xlarge",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected an unsupported instance type to fail parsing"
+        );
+        let Some(err) = result.err() else {
+            return;
+        };
+        let message = err.to_string();
+        assert!(message.contains("tdx.xlarge"), "{message}");
+        assert!(message.contains("tdx.small"), "{message}");
+        assert!(message.contains("tdx.medium"), "{message}");
+        assert!(
+            message.contains("registry attests only these sizes"),
+            "{message}"
+        );
     }
 
     #[test]

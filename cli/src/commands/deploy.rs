@@ -106,7 +106,7 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         project_dir,
         image_repo: flags.image_repo,
         image_tag: flags.image_tag,
-        instance_type: flags.instance_type,
+        instance_type: flags.instance_type.as_str().to_owned(),
         disk_size: flags.disk_size,
         repo_root: flags.repo_root,
         version: flags.version,
