@@ -58,6 +58,8 @@ clusters: [ ... ]             # Envoy cluster objects
 ```
 
 A direct upstream (not `cloud`, not `disabled`) must name an `auth_header`.
+Mapping keys must be strings; quote numeric or boolean-looking keys in Envoy
+metadata (for example, `"true"` or `"012"`).
 
 ### Adding a supplier
 

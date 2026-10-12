@@ -28,7 +28,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
 use serde::Deserialize;
-use serde_yaml_ng::Value;
+use serde_json::Value;
 
 const ROUTES_MARKER: &str = "gm:upstream-routes";
 const CLUSTERS_MARKER: &str = "gm:upstream-clusters";
@@ -155,9 +155,22 @@ fn load_upstreams(
         if !providers.insert(provider.to_owned()) {
             bail!("{provider} has more than one upstream file selected");
         }
-        let text = std::fs::read_to_string(&path)?;
-        let file: UpstreamFile = serde_yaml_ng::from_str(&substitute(&text, env, &path)?)
-            .with_context(|| format!("parse {}", path.display()))?;
+        // Validate the schema through JSON: serde-saphyr's typed deserializer
+        // otherwise accepts null lists and quoted booleans, hiding mistakes.
+        let value = parse_rendered(&path, env)?;
+        // JSON's struct deserializer also accepts positional arrays. YAML
+        // upstream and slots settings must use mappings with named fields.
+        if !value.is_object() {
+            bail!("{}: upstream must be a mapping", path.display());
+        }
+        if value
+            .get("slots")
+            .is_some_and(|slots| !slots.is_null() && !slots.is_object())
+        {
+            bail!("{}: slots must be a mapping or null", path.display());
+        }
+        let file: UpstreamFile =
+            serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
         if let Some(slots) = &file.slots {
             if !slots.cloud && !slots.disabled && slots.auth_header.is_none() {
                 bail!(
@@ -195,8 +208,23 @@ fn check_selections(
 
 fn parse_rendered(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Result<Value> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_yaml_ng::from_str(&substitute(&text, env, path)?)
-        .with_context(|| format!("parse {}", path.display()))
+    let text = substitute(&text, env, path)?;
+    let value = serde_saphyr::from_str_with_options(
+        &text,
+        serde_saphyr::options! {
+            // Preserve the old parser's YAML 1.2 booleans and literal merge keys.
+            strict_booleans: true,
+            merge_keys: serde_saphyr::options::MergeKeyPolicy::AsOrdinary,
+            ignore_binary_tag_for_string: true,
+            // JSON mapping keys must be strings. Do not coerce boolean/numeric
+            // keys: that bypasses YAML duplicate-key and non-finite checks.
+            no_schema: true,
+            // Substitution has already inserted secrets into this source text.
+            with_snippet: false,
+        },
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    Ok(value)
 }
 
 /// Replace each `__GM_<NAME>__` with `GM_<NAME>` in one pass. Inserted values
@@ -230,13 +258,12 @@ fn substitute(text: &str, env: &dyn Fn(&str) -> Option<String>, path: &Path) -> 
 }
 
 fn add_internal_header_strip(route: &mut Value, provider: &str) -> Result<()> {
-    let Value::Mapping(map) = route else {
+    let Value::Object(map) = route else {
         bail!("a route in upstreams/{provider}*.yaml is not a mapping");
     };
-    let key = Value::from("request_headers_to_remove");
-    let mut headers = match map.remove(&key) {
+    let mut headers = match map.remove("request_headers_to_remove") {
         None => Vec::new(),
-        Some(Value::Sequence(existing)) => existing,
+        Some(Value::Array(existing)) => existing,
         Some(_) => bail!("{provider}: request_headers_to_remove must be a list"),
     };
     for header in GM_INTERNAL_HEADERS {
@@ -245,13 +272,16 @@ fn add_internal_header_strip(route: &mut Value, provider: &str) -> Result<()> {
             headers.push(header);
         }
     }
-    map.insert(key, Value::Sequence(headers));
+    map.insert(
+        "request_headers_to_remove".to_owned(),
+        Value::Array(headers),
+    );
     Ok(())
 }
 
 /// Replace the one list item equal to `marker` with `items`.
 fn splice(root: &mut Value, marker: &str, items: Vec<Value>) -> Result<()> {
-    let marker_value = Value::from(marker);
+    let marker_value = Value::String(marker.to_owned());
     let mut found = 0;
     visit_sequences(root, &mut |seq| {
         found += seq.iter().filter(|item| **item == marker_value).count();
@@ -270,18 +300,17 @@ fn splice(root: &mut Value, marker: &str, items: Vec<Value>) -> Result<()> {
 
 fn visit_sequences(value: &mut Value, visit: &mut dyn FnMut(&mut Vec<Value>)) {
     match value {
-        Value::Sequence(seq) => {
+        Value::Array(seq) => {
             visit(seq);
             for item in seq {
                 visit_sequences(item, visit);
             }
         }
-        Value::Mapping(map) => {
-            for (_, item) in map.iter_mut() {
+        Value::Object(map) => {
+            for item in map.values_mut() {
                 visit_sequences(item, visit);
             }
         }
-        Value::Tagged(tagged) => visit_sequences(&mut tagged.value, visit),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
@@ -683,5 +712,163 @@ clusters:
         );
         let err = fixture.render(&[], &[]).expect_err("repeated marker");
         assert!(format!("{err}").contains("found 2"), "{err}");
+    }
+
+    #[test]
+    fn malformed_yaml_error_names_the_file_and_location() {
+        let fixture = Fixture::new(BASE, &[("acme.yaml", "routes: [\n")]);
+        let err = fixture.render(&[], VARS).expect_err("malformed YAML");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("parse") && message.contains("acme.yaml"),
+            "{message}"
+        );
+        assert!(
+            message.contains("line") || message.contains("column"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn yaml_anchors_and_string_tags_preserve_values_without_expanding_merge_keys() {
+        let fixture = Fixture::new(
+            BASE,
+            &[(
+                "acme.yaml",
+                "routes: [{name: &name !!str 2023-06-01}, {name: *name}, {<<: {name: merged}}]\n",
+            )],
+        );
+        let value = parsed(&fixture.render(&[], VARS).expect("render"));
+        assert_eq!(value["routes"][1]["name"], "2023-06-01");
+        assert_eq!(value["routes"][2]["name"], "2023-06-01");
+        assert_eq!(value["routes"][3]["<<"]["name"], "merged");
+        assert!(value["routes"][3].get("name").is_none());
+    }
+
+    #[test]
+    fn yaml_multiple_documents_are_rejected_by_single_document_parser() {
+        for (base, upstream) in [
+            (format!("{BASE}---\nother: document\n"), "routes: []"),
+            (BASE.to_owned(), "routes: []\n---\nclusters: []\n"),
+        ] {
+            let fixture = Fixture::new(&base, &[("acme.yaml", upstream)]);
+            fixture.render(&[], VARS).expect_err("multiple documents");
+        }
+    }
+
+    #[test]
+    fn yaml_boolean_like_strings_keep_yaml12_types() {
+        let fields =
+            "values: [on, off, yes, no, ON, OFF, YES, NO, true, false, True, False, TRUE, FALSE]";
+        let fixture = Fixture::new(
+            &format!("{BASE}{fields}\n"),
+            &[("acme.yaml", &format!("routes: [{{{fields}}}]\n"))],
+        );
+        let value = parsed(&fixture.render(&[], VARS).expect("render"));
+        let expected = serde_json::json!([
+            "on", "off", "yes", "no", "ON", "OFF", "YES", "NO", true, false, true, false, true,
+            false
+        ]);
+        assert_eq!(value["values"], expected);
+        assert_eq!(value["routes"][1]["values"], expected);
+    }
+
+    #[test]
+    fn invalid_upstream_schema_is_rejected() {
+        // Calibration: serde-saphyr's typed deserializer accepts null lists
+        // and quoted booleans, unlike the old renderer's schema checks.
+        for yaml in [
+            "null\n",
+            "routes: null\n",
+            "clusters: ~\n",
+            "slots: {direct_env: KEY, cloud: on}\n",
+            "slots: {direct_env: KEY, cloud: \"true\"}\n",
+            "slots: {direct_env: KEY, disabled: \"true\"}\n",
+            "slots: {direct_env: KEY, cloud: true, typo: 1}\n",
+            "<<: {routes: []}\n",
+        ] {
+            let fixture = Fixture::new(BASE, &[("acme.yaml", yaml)]);
+            let err = fixture.render(&[], VARS).expect_err(yaml);
+            assert!(format!("{err:#}").contains("acme.yaml"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn positional_upstream_fields_are_rejected() {
+        // Calibration: serde_json can deserialize this array as UpstreamFile,
+        // bypassing the YAML schema's requirement for named fields.
+        let fixture = Fixture::new(BASE, &[("acme.yaml", "[null, [], []]\n")]);
+        let err = fixture.render(&[], VARS).expect_err("upstream mapping");
+        let message = format!("{err:#}");
+        assert!(message.contains("acme.yaml"), "{message}");
+        assert!(message.contains("mapping"), "{message}");
+    }
+
+    #[test]
+    fn positional_slot_fields_are_rejected() {
+        // These arrays have every Slots field and would otherwise be accepted.
+        for yaml in [
+            "slots: [KEY, false, false, authorization, \"Bearer \"]\n",
+            "slots: [KEY, true, false, null, \"\"]\n",
+        ] {
+            let fixture = Fixture::new(BASE, &[("acme.yaml", yaml)]);
+            let err = fixture.render(&[], VARS).expect_err("slots mapping");
+            let message = format!("{err:#}");
+            assert!(message.contains("acme.yaml"), "{message}");
+            assert!(message.contains("slots"), "{message}");
+            assert!(message.contains("mapping"), "{message}");
+        }
+    }
+
+    #[test]
+    fn duplicate_yaml_keys_are_rejected() {
+        for (base, upstream) in [
+            (format!("{BASE}duplicate: 1\nduplicate: 2\n"), "routes: []"),
+            (BASE.to_owned(), "routes: [{name: first, name: second}]\n"),
+        ] {
+            let fixture = Fixture::new(&base, &[("acme.yaml", upstream)]);
+            let err = fixture.render(&[], VARS).expect_err("duplicate key");
+            assert!(format!("{err:#}").contains("duplicate"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn yaml_errors_do_not_include_substituted_source_snippets() {
+        // Calibration: default snippet diagnostics print the preceding line's
+        // substituted secret even though that line did not cause the error.
+        for (base, upstream, filename) in [
+            (
+                "secret: __GM_NODE_SECRET__\nmalformed: ]\n",
+                "routes: []\n",
+                "base.yaml",
+            ),
+            (
+                BASE,
+                "routes: [{name: __GM_NODE_SECRET__}]\nmalformed: ]\n",
+                "acme.yaml",
+            ),
+        ] {
+            let fixture = Fixture::new(base, &[("acme.yaml", upstream)]);
+            let err = fixture.render(&[], VARS).expect_err("malformed YAML");
+            let message = format!("{err:#}");
+            assert!(message.contains(filename), "{message}");
+            assert!(message.contains("line 2"), "{message}");
+            assert!(!message.contains("secret-0001"), "{message}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_yaml_keys_are_rejected_instead_of_coerced_to_strings() {
+        // Calibration: a JSON map requests String keys, so the parser accepts
+        // non-finite keys and misses duplicate boolean keys without no_schema.
+        for mapping in ["{true: a, True: b}", "{.nan: a}", "{.inf: a}"] {
+            for (base, upstream) in [
+                (format!("{BASE}extra: {mapping}\n"), "routes: []".to_owned()),
+                (BASE.to_owned(), format!("routes: [{mapping}]\n")),
+            ] {
+                let fixture = Fixture::new(&base, &[("acme.yaml", &upstream)]);
+                fixture.render(&[], VARS).expect_err(mapping);
+            }
+        }
     }
 }
