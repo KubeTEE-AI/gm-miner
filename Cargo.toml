@@ -5,10 +5,10 @@ members = ["attestd", "azure-verify", "cli"]
 [workspace.package]
 version = "0.4.27"
 edition = "2021"
-# 1.88 is the floor of the locked dependency tree: the dstack-sdk ->
-# alloy chain (pulled in by the attestd crate) requires rustc 1.88+
-# transitively (time, serde_with). The image builds with a newer
-# toolchain still — see image/Dockerfile.
+# 1.88 is the workspace floor for the attestation crates: the dstack-sdk ->
+# alloy chain (pulled in by attestd) requires rustc 1.88+ transitively
+# (time, serde_with). gmcli overrides this to 1.89 for serde-saphyr in
+# cli/Cargo.toml. The image uses a newer toolchain; see image/Dockerfile.
 rust-version = "1.88"
 license = "Apache-2.0"
 publish = false

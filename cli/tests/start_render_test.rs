@@ -50,7 +50,7 @@ where
 }
 
 fn config(rendered: &str) -> Value {
-    serde_yaml_ng::from_str(rendered).expect("rendered Envoy config must be valid YAML")
+    serde_json::from_str(rendered).expect("rendered Envoy config must be valid JSON")
 }
 
 fn ingress(config: &Value) -> &Value {
