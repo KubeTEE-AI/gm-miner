@@ -104,8 +104,8 @@ const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
 /// (`dstack-0.5.12`), published by dstack's reproducible OS image build and
 /// reported in every CVM's attestation TCB info (`os.os_image_hash`). It is
 /// verifiable against any live gm CVM on that image and against the
-/// registry's approved baseline; the gate test
-/// [`tests::os_image_hash_matches_registry_baseline`] anchors it. Bump this
+/// release's approved `ImageVersion` rows; the gate test
+/// [`tests::os_image_hash_matches_published_measurement`] anchors it. Bump this
 /// in lockstep with `DEFAULT_OS_IMAGE`.
 pub const PINNED_OS_IMAGE_HASH: &str =
     "8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd";
@@ -379,7 +379,7 @@ mod tests {
     /// publishes for `DEFAULT_OS_IMAGE` (`phala cvms list-nodes`) and the live
     /// CVM's measured `os.os_image_hash`.
     #[test]
-    fn os_image_hash_matches_registry_baseline() {
+    fn os_image_hash_matches_published_measurement() {
         assert_eq!(
             PINNED_OS_IMAGE_HASH,
             "8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd"
