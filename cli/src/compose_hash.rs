@@ -101,14 +101,14 @@ const CANONICAL_ALLOWED_ENVS: [&str; 30] = [
 /// The pinned dstack OS image's published reproducible `os_image_hash`.
 ///
 /// This is the measurement of [`crate::deploy::DEFAULT_OS_IMAGE`]
-/// (`dstack-0.5.9`), published by dstack's reproducible OS image build and
+/// (`dstack-0.5.12`), published by dstack's reproducible OS image build and
 /// reported in every CVM's attestation TCB info (`os.os_image_hash`). It is
 /// verifiable against any live gm CVM on that image and against the
-/// registry's approved baseline; the gate test
-/// [`tests::os_image_hash_matches_registry_baseline`] anchors it. Bump this
+/// release's approved `ImageVersion` rows; the gate test
+/// [`tests::os_image_hash_matches_published_measurement`] anchors it. Bump this
 /// in lockstep with `DEFAULT_OS_IMAGE`.
 pub const PINNED_OS_IMAGE_HASH: &str =
-    "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033";
+    "8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd";
 
 /// The pinned `app_compose` security and runtime flag fields a gm release
 /// deploy produces, as `(field, value)` pairs. `gateway_enabled` and
@@ -375,14 +375,14 @@ mod tests {
         assert_ne!(a, b, "a different image digest must move the compose_hash");
     }
 
-    /// The pinned OS image hash must match the registry's approved baseline
-    /// (every supported testnet row shares it) and the live CVM's measured
-    /// `os.os_image_hash`.
+    /// The pinned OS image hash must match the `os_image_hash` Phala Cloud
+    /// publishes for `DEFAULT_OS_IMAGE` (`phala cvms list-nodes`) and the live
+    /// CVM's measured `os.os_image_hash`.
     #[test]
-    fn os_image_hash_matches_registry_baseline() {
+    fn os_image_hash_matches_published_measurement() {
         assert_eq!(
             PINNED_OS_IMAGE_HASH,
-            "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033"
+            "8db40cb23008d6213668b5816702d100b37b859a8a5bfd18d938ae3a1b3715bd"
         );
     }
 }
