@@ -4,6 +4,42 @@ slots:
   auth_prefix: "Bearer "
 
 routes:
+  ## GM's MiniMax H3 adapter sends an Engy-native task request. Creating a
+  ## video is non-idempotent: never retry the POST after an upstream reset.
+  - match:
+      path: "/v2/video_generation"
+      headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
+        - name: "x-gm-provider"
+          string_match:
+            exact: "engy"
+    route:
+      cluster: engy
+      host_rewrite_literal: api.engy.ai
+      timeout: 1800s
+  ## The adapter polls and downloads jobs through the same pinned worker.
+  - match:
+      prefix: "/v2/query/video_generation/"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "engy"
+    route:
+      cluster: engy
+      host_rewrite_literal: api.engy.ai
+      timeout: 1800s
+  - match:
+      prefix: "/v2/video_generation/"
+      headers:
+        - name: "x-gm-provider"
+          string_match:
+            exact: "engy"
+    route:
+      cluster: engy
+      host_rewrite_literal: api.engy.ai
+      timeout: 1800s
   ##  api.engy.ai serves the OpenAI-compatible surface
   ##  under /v1 itself, so no path rewrite is needed.
   - match:

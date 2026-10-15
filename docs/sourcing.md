@@ -56,6 +56,7 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.3-flash-tee` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-tee` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
 | `minimax/h3` | `kubetee/minimax/h3` | `llm.kubetee.ai` | `--kubetee` |
+| `minimax/h3` | `engy/MiniMax-H3` | `api.engy.ai` (`/v2/video_generation`) | `--engy` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | retired by KubeTEE | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
@@ -85,6 +86,12 @@ Video routes serve ordinary supply and require a worker image with `video-jobs-v
 Wan 2.6 serves 1920x1080 video; Veo 3.1-fast serves eight-second 1280x720 video.
 Video suppliers may charge the miner when a job is accepted. If an accepted
 job later fails, the buyer is not charged and the miner carries any upstream job cost.
+Engy's `MiniMax-H3` route additionally requires the approved image feature
+`engy-video-v2`, which proves its native create path disables retries. Older
+`video-jobs-v1` images cannot serve it. The route uses the native asynchronous V2 task API and the existing
+`--engy` key. Engy keeps video prompts and finished clips until the task is deleted, even
+when account-level zero data retention is enabled; the gateway deletes the task after the
+buyer's one-hour artifact window.
 
 ### FLUX.2 Klein image generation
 

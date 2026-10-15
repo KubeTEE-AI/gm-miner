@@ -85,6 +85,7 @@ authority for which explicit routes that registry has published.
 | `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`) |
 | `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
 | `MiMo V2.6 Pro Ultraspeed TEE` | KubeTEE: `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
+| `MiniMax H3` | KubeTEE: `kubetee/minimax/h3` (`--kubetee`); Engy: `engy/MiniMax-H3` (`--engy`, native async video API) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
 | `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: ARM-verified transport, feature-gated admission |
