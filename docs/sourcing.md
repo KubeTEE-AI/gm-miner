@@ -34,6 +34,8 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.1-tee` | `chutes/zai-org/GLM-5.1-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2-tee` | `chutes/zai-org/GLM-5.2-TEE` | `llm.chutes.ai` | `--chutes` |
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
+| `zai/glm-5.3` | `deepinfra/zai-org/GLM-5.3` | `api.deepinfra.com` | `--deepinfra` |
+| `zai/glm-5.3-flash` | `deepinfra/zai-org/GLM-5.3-Flash` | `api.deepinfra.com` | `--deepinfra` |
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4-flash-0731` | `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` | `api.deepinfra.com` | `--deepinfra` |
 | `deepseek/deepseek-v4.1-flash` | `deepinfra/deepseek-ai/DeepSeek-V4.1-Flash` | `api.deepinfra.com` | `--deepinfra` |
@@ -241,6 +243,8 @@ gmcli declare-product --provider engy --model glm-5.3 --discount-pct 5
 gmcli declare-product --provider engy --model glm-5.3-flash --discount-pct 5
 gmcli declare-product --provider engy --model ornith-1.5-397b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
+gmcli declare-product --provider deepinfra --model zai-org/GLM-5.3 --discount-pct 5
+gmcli declare-product --provider deepinfra --model zai-org/GLM-5.3-Flash --discount-pct 5
 gmcli declare-product --provider deepinfra --model moonshotai/Kimi-K3 --discount-pct 5
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4-Flash-0731 --discount-pct 5
 gmcli declare-product --provider deepinfra --model deepseek-ai/DeepSeek-V4.1-Flash --discount-pct 5
@@ -427,3 +431,12 @@ selection, request/response adaptation and pricing; the miner forwards the body
 unchanged using the selected credential slot. Native image offers require a
 newly built and approved image carrying this feature. Historical approved images
 are not relabelled. Ordinary DeepInfra chat retains the OpenAI path rewrite.
+
+### DeepInfra GLM-5.3 and Flash
+
+`deepinfra/zai-org/GLM-5.3` serves `zai/glm-5.3` (text only).
+`deepinfra/zai-org/GLM-5.3-Flash` serves `zai/glm-5.3-flash` (text and images).
+These case-sensitive source IDs serve the ordinary buyer products.
+
+Configure a DeepInfra key with `gmcli set-api-keys --deepinfra <key>`, deploy
+the worker, then declare each offer using the commands above.
