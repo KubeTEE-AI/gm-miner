@@ -77,7 +77,7 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 7] = [
+pub const IMAGE_FEATURES: [&str; 8] = [
     "upstream-key-slots",
     "upstream-model-hop",
     "deepinfra-native-images",
@@ -85,6 +85,7 @@ pub const IMAGE_FEATURES: [&str; 7] = [
     "kubetee-attested-chat",
     "kubetee-no-retry-images",
     "video-jobs-v1",
+    "engy-video-v2",
 ];
 
 /// The git provenance stamped onto a published version.
@@ -447,7 +448,8 @@ mod tests {
                 "chutes-verified-chat",
                 "kubetee-attested-chat",
                 "kubetee-no-retry-images",
-                "video-jobs-v1"
+                "video-jobs-v1",
+                "engy-video-v2"
             ]),
         );
     }

@@ -411,10 +411,13 @@ static_resources:
                           end
 
                           local function non_replayable_request(headers, provider, bare)
-                            if provider ~= "deepinfra" and provider ~= "kubetee" then
+                            if provider ~= "deepinfra" and provider ~= "kubetee" and provider ~= "engy" then
                               return false
                             end
                             if bare == "/v1/videos" or bare:sub(1, 11) == "/v1/videos/" then
+                              return headers:get(":method") == "POST"
+                            end
+                            if provider == "engy" and bare == "/v2/video_generation" then
                               return headers:get(":method") == "POST"
                             end
                             if provider == "deepinfra" then
