@@ -61,6 +61,7 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-tee` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
+| `deepseek/deepseek-v4.1-flash-1017-tee` | `kubetee/deepseek/deepseek-v4.1-flash-1017` | `llm.kubetee.ai` | `--kubetee` |
 | `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
 | `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
 | `bfl/flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
