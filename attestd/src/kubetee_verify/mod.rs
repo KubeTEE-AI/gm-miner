@@ -50,11 +50,12 @@ pub const MODELS: &str = "/v1/models";
 
 /// Every `KubeTEE` chat model gm sources, by the upstream id its route
 /// names (`kubetee/<id>` in `docs/sourcing.md`).
-pub const TARGETS: [&str; 6] = [
+pub const TARGETS: [&str; 7] = [
     "z-ai/glm-5.2",
     "z-ai/glm-5.3",
     "z-ai/glm-5.3-flash",
     "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4.1-flash-1017",
     "ornith/ornith-1.5-397b",
     "xiaomi/mimo-v2.6-pro",
 ];
