@@ -437,6 +437,7 @@ static_resources:
                               ["z-ai/glm-5.3"] = true,
                               ["z-ai/glm-5.3-flash"] = true,
                               ["deepseek/deepseek-v4.1-flash"] = true,
+                              ["deepseek/deepseek-v4.1-flash-1017"] = true,
                               ["ornith/ornith-1.5-397b"] = true,
                               ["xiaomi/mimo-v2.6-pro"] = true,
                             },
