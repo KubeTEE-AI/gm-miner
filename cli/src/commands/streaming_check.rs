@@ -619,6 +619,7 @@ impl ProbeModels {
     fn models_for(&self, provider: &Provider) -> Vec<ProbeModel> {
         match self.models.get(provider) {
             Some(models) if !models.is_empty() => models.clone(),
+            _ if provider == &Provider::Together => Vec::new(),
             _ => vec![ProbeModel {
                 canonical: fallback_model(provider).to_owned(),
                 upstream: None,
@@ -819,6 +820,9 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
+        Provider::Together => unreachable!(
+            "Together is enabled only for speech routes and is not a chat streaming probe"
+        ),
         // Last resort only when `/miners/me` has no kubetee offer. Prefer GLM
         // over kimi; flash is probed once declared (see #185 / sources).
         Provider::Kubetee => "z-ai/glm-5.2",
@@ -846,6 +850,7 @@ fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> 
             openai_compatible_probe(provider, model, slot, "/v1beta/openai/chat/completions")
         }
         Provider::OpenAI
+        | Provider::Together
         | Provider::Chutes
         | Provider::Zai
         | Provider::Moonshot
