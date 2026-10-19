@@ -20,17 +20,6 @@ routes:
       host_rewrite_literal: api.together.xyz
       timeout: 1800s
 
-  - match:
-      prefix: "/"
-      headers:
-        - name: "x-gm-provider"
-          string_match:
-            exact: "together"
-    route:
-      cluster: together
-      host_rewrite_literal: api.together.xyz
-      timeout: 1800s
-
 clusters:
   - name: together
     type: LOGICAL_DNS

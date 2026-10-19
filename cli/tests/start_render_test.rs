@@ -824,6 +824,8 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
     ]);
     assert!(status.success(), "render failed: {stderr}");
     let parsed = config(&rendered);
+    // Together is intentionally excluded: it is a speech-only upstream and
+    // has its own exact-path tests below.
     for provider in [
         "anthropic",
         "openai",
@@ -832,7 +834,6 @@ fn internal_headers_are_stripped_without_changing_provider_or_near_routing() {
         "zai",
         "moonshot",
         "deepinfra",
-        "together",
         "kubetee",
         "engy",
         "moonmath",
@@ -2188,6 +2189,31 @@ fn together_audio_speech_uses_a_keyed_non_replaying_route() {
         "Bearer together-key"
     );
     assert_retry_overrides_stripped(&lua);
+}
+
+#[test]
+fn together_rejects_non_speech_paths_and_methods() {
+    let (status, _, stderr, rendered) = render_envoy([("TOGETHER_API_KEY", "together-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let parsed = config(&rendered);
+    for (method, path) in [
+        ("POST", "/v1/chat/completions"),
+        ("GET", "/v1/audio/speech"),
+        ("POST", "/v1/audio/speech/extra"),
+    ] {
+        let selected = matching_route(
+            &parsed,
+            path,
+            &[
+                (":method".to_owned(), method.to_owned()),
+                ("x-gm-provider".to_owned(), "together".to_owned()),
+            ],
+        );
+        assert_eq!(
+            selected["direct_response"]["status"], 501,
+            "Together must reject {method} {path} instead of forwarding it"
+        );
+    }
 }
 
 #[test]

@@ -116,3 +116,21 @@ or settlement checks are performed by these tests. A paid speech canary remains
 deferred because gmcli has no safe buyer-authenticated gateway request and
 reconciliation path. `doctor` remains a free local configuration check and does
 not claim live TTS serving.
+
+## Together speech-only route regression
+
+The Together transport regression tests were added before the fix. Envoy's
+rendered Together configuration sent `POST /v1/chat/completions` to the Together
+cluster instead of returning the local 501, and streaming-check model coverage
+could turn a Together Kokoro model into a chat probe. The transport now has only
+the reviewed `POST /v1/audio/speech` route. The streaming checker treats
+Together as speech-only, reports chat probes as skipped, and has no fallback
+chat model for it. The general provider-routing test excludes Together because
+the dedicated speech tests cover its only supported route.
+
+The red tests failed on those specific assertions; after the fix both focused
+tests passed. The full `cargo test -p gmcli --all-features --quiet` run passed
+812 tests with one read-only live RPC test ignored. Strict all-target/all-feature
+Clippy, formatting, and `git diff --check` passed. `scripts/validate-envoy.sh`
+passed its rendered variants and Chutes/KubeTEE runtime checks with Together
+enabled in the direct-all configuration. No Together API request was made.
