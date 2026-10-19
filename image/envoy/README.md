@@ -94,6 +94,12 @@ These apply to every provider route unless its file says otherwise.
   benchmark (it would distort the measurement). The Lua filter also strips caller-supplied `x-envoy-retry-*`
   headers on native inference, image generation, and video POSTs. Engy video
   admission requires the `engy-video-v2` approved image feature.
+- **HTTP/2 upstream clusters cap each connection at 32 streams and send a
+  keepalive PING about every 30s** (10s timeout). A dropped connection then
+  fails at most 32 in-flight streams, and a silently dead one is closed within
+  about 40s instead of sitting idle for up to 30 minutes. The cap limits
+  streams per connection, not per cluster: Envoy opens another connection when
+  one is full.
 - **Keyless probes see a 401.** A direct route stays in place when its key is
   unset. Lua then sends an empty key, the upstream answers 401, and the
   registry reads "no key" the same way it reads "key revoked".

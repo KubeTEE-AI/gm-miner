@@ -75,7 +75,11 @@ clusters:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config:
-          http2_protocol_options: {}
+          http2_protocol_options:
+            max_concurrent_streams: 32
+            connection_keepalive:
+              interval: 30s
+              timeout: 10s
     load_assignment:
       cluster_name: kubetee
       endpoints:
