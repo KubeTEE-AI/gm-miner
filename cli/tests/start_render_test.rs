@@ -563,12 +563,22 @@ fn direct_routes_preserve_native_paths_and_tls_pins() {
             ["tls_minimum_protocol_version"],
         "TLSv1_3"
     );
-    for provider in ["kubetee", "engy"] {
+    for provider in [
+        "anthropic",
+        "openai",
+        "gemini",
+        "kubetee",
+        "engy",
+        "moonmath",
+    ] {
         assert_eq!(
             cluster(&parsed, provider)["typed_extension_protocol_options"]
                 ["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]["explicit_http_config"]
                 ["http2_protocol_options"],
-            json!({})
+            json!({
+                "max_concurrent_streams": 32,
+                "connection_keepalive": {"interval": "30s", "timeout": "10s"}
+            })
         );
     }
 }
