@@ -35,9 +35,6 @@ support alone does not establish source equivalence, voice coverage, credentials
 pricing eligibility, or live supply. Reviewed registry profiles and worker
 admission are required before these sources can serve a buyer product.
 
-See [speech transport validation](tts-validation.md) for the implemented paths,
-capability flags, local checks, and the deferred Google Cloud OAuth transport.
-
 ## The routes
 
 | Buyer product | Route | Upstream host | Key flag |
