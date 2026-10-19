@@ -64,6 +64,12 @@ clusters:
     typed_extension_protocol_options:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        ## api.engy.ai's edge closes HTTP/2 connections with streams still in
+        ## flight, failing every stream on them at once. One request per
+        ## connection limits a close to that request, and the connection is
+        ## never older than the request it carries.
+        common_http_protocol_options:
+          max_requests_per_connection: 1
         explicit_http_config:
           http2_protocol_options:
             max_concurrent_streams: 32

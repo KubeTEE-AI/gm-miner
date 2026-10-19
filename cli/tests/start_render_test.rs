@@ -580,6 +580,14 @@ fn direct_routes_preserve_native_paths_and_tls_pins() {
                 "connection_keepalive": {"interval": "30s", "timeout": "10s"}
             })
         );
+        let common = &cluster(&parsed, provider)["typed_extension_protocol_options"]
+            ["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]
+            ["common_http_protocol_options"];
+        if provider == "engy" {
+            assert_eq!(common, &json!({"max_requests_per_connection": 1}));
+        } else {
+            assert!(common.is_null(), "{provider} reuses connections");
+        }
     }
 }
 

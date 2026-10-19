@@ -100,6 +100,10 @@ These apply to every provider route unless its file says otherwise.
   about 40s instead of sitting idle for up to 30 minutes. The cap limits
   streams per connection, not per cluster: Envoy opens another connection when
   one is full.
+- **Engy opens a new connection for every request.** Its edge closes HTTP/2
+  connections with streams in flight, so the `engy` cluster sets
+  `max_requests_per_connection: 1`: a close fails only the request it carried.
+  The cost is a TCP and TLS handshake per request.
 - **Keyless probes see a 401.** A direct route stays in place when its key is
   unset. Lua then sends an empty key, the upstream answers 401, and the
   registry reads "no key" the same way it reads "key revoked".
