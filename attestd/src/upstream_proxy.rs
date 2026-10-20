@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
@@ -17,11 +17,31 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// How many times an attestation is attempted before the request fails.
 pub const ATTESTATION_ATTEMPTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct PendingHandshake<'a> {
+    provider: &'a str,
+    peer: SocketAddr,
+    started: Instant,
+    completed: bool,
+}
+
+impl Drop for PendingHandshake<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            info!(
+                provider = self.provider,
+                peer = %self.peer,
+                elapsed_ms = self.started.elapsed().as_millis(),
+                "upstream TLS handshake cancelled"
+            );
+        }
+    }
+}
 
 /// One HTTP/1.1 connection over TLS to an upstream, with the leaf
 /// certificate the server presented on it.
@@ -72,8 +92,15 @@ pub async fn connect(
         .with_context(|| format!("read {provider} peer address for {host}"))?;
     let server_name = ServerName::try_from(host.to_owned())
         .with_context(|| format!("invalid {provider} TLS server name"))?;
-    let stream = timeout(CONNECT_TIMEOUT, tls.connect(server_name, tcp))
-        .await
+    let mut pending = PendingHandshake {
+        provider,
+        peer,
+        started: Instant::now(),
+        completed: false,
+    };
+    let result = timeout(CONNECT_TIMEOUT, tls.connect(server_name, tcp)).await;
+    pending.completed = true;
+    let stream = result
         .with_context(|| format!("{provider} TLS handshake timed out"))?
         .with_context(|| format!("complete {provider} TLS handshake"))?;
     let leaf = stream
