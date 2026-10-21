@@ -111,6 +111,12 @@ pub fn build_data_plane_probe_client() -> Result<Client> {
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("gmcli/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
+        // Streaming diagnostics can trigger billable upstream work. Do not
+        // replay a request after an HTTP/2 protocol NACK or reuse an idle
+        // connection for another probe.
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .retry(reqwest::retry::never())
         .danger_accept_invalid_certs(true)
         .build()
         .context("build data-plane probe http client")

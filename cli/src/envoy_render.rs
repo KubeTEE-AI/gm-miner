@@ -633,7 +633,17 @@ clusters:
             .find(|route| route["match"]["path"] == "/v1/messages")
             .expect("Bedrock route");
         assert_eq!(route["match"]["path"], "/v1/messages");
-        assert!(route["retry_policy"].is_null());
+        let has_action_retry_policy = |candidate: &serde_json::Value| {
+            candidate
+                .pointer("/route/retry_policy")
+                .is_some_and(|policy| !policy.is_null())
+        };
+        assert!(!has_action_retry_policy(route));
+        let policy_bearing_fixture = serde_json::json!({
+            "retry_policy": null,
+            "route": {"retry_policy": {"retry_on": "5xx", "num_retries": 1}}
+        });
+        assert!(has_action_retry_policy(&policy_bearing_fixture));
         assert!(route["request_headers_to_remove"]
             .as_array()
             .expect("removed headers")

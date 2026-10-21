@@ -371,7 +371,7 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
         })
         .expect("exact Bedrock Messages POST route");
     assert_eq!(selected["route"]["cluster"], "bedrock_mantle_adapter");
-    assert!(selected["retry_policy"].is_null());
+    assert!(selected["route"]["retry_policy"].is_null());
     assert!(selected["request_headers_to_remove"]
         .as_array()
         .expect("removed headers")

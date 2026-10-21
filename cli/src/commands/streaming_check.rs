@@ -15,6 +15,7 @@ use gm_miner_cli::{
         is_reviewed_bedrock_binding, REVIEWED_BEDROCK_MODEL, REVIEWED_BEDROCK_PROVIDER,
     },
     config::{Config, ProviderKeys, WorkerRecord},
+    slots::parse_key_slots,
     types::{
         MinerStatus, Product, ProductCatalogResponse, Provider, SourceProduct, WorkerEntry,
         WorkerListResponse,
@@ -34,6 +35,8 @@ const BUFFERED_BURST_SPAN: Duration = Duration::from_millis(250);
 const BUFFERED_FIRST_WAIT: Duration = Duration::from_secs(1);
 const BUFFERED_RATIO: f64 = 0.20;
 const MAX_TOKENS: u32 = 32;
+const BEDROCK_MANTLE_ROUTE_HEADER: &str = "x-gm-bedrock-mantle-opus48-route";
+const BEDROCK_MANTLE_ROUTE_MARKER: &str = "1";
 
 const BUFFERED_GUIDANCE: &str = "Your {provider} upstream returned a buffered response: \
 the whole completion arrived in one burst instead of token-by-token. Buyers see slow \
@@ -84,6 +87,9 @@ struct ProviderProbe {
     model: String,
     slot: Option<String>,
     fallback: bool,
+    /// Internal per-inference context. Set only after the selected worker's
+    /// Bedrock backend, canonical model, and authorized key slot are proven.
+    bedrock_mantle_route_marker: bool,
     path: &'static str,
     body: Value,
 }
@@ -137,6 +143,11 @@ struct ProbeTiming {
     last: Duration,
     span: Duration,
     chunks: usize,
+}
+
+struct ProbeRouteAuthorization {
+    slot: Option<String>,
+    bedrock_mantle_route_marker: bool,
 }
 
 /// Runs the standalone streaming self-test against the miner's primary worker.
@@ -206,7 +217,7 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
         declared.as_ref().unwrap_or(&empty_declared),
     );
     for provider in providers {
-        check_provider_streaming(target, provider, &model_catalog, &excluded).await;
+        check_provider_streaming(cfg, target, provider, &model_catalog, &excluded).await;
     }
 }
 
@@ -253,6 +264,7 @@ fn warn_unreadable_declarations(providers: &[Provider]) {
 }
 
 async fn check_provider_streaming(
+    cfg: &Config,
     target: &StreamingTarget,
     provider: Provider,
     model_catalog: &ProbeModels,
@@ -291,10 +303,77 @@ async fn check_provider_streaming(
             );
             continue;
         }
-        let probe = build_probe(provider.clone(), &selected.model, selected.slot);
+        let Some(route) = probe_route_authorization(cfg, target, &provider, &selected) else {
+            println!(
+                "  [--] {provider}/{}: exact Bedrock route slot is not verified or derivable; \
+                 no streaming probe sent",
+                selected.model.canonical
+            );
+            continue;
+        };
+        let mut probe = build_probe(provider.clone(), &selected.model, route.slot);
+        probe.bedrock_mantle_route_marker = route.bedrock_mantle_route_marker;
         let result = run_provider_probe(target, &probe).await;
         print_probe_result(&probe, result);
     }
+}
+
+/// Authorize the internal route marker only when this probe has an exact
+/// Bedrock backend/model/slot binding. Standalone checks use the selected
+/// worker's registry-verified slot ownership; the immediate post-deploy
+/// advisory derives the slot from the key and node secret used for that
+/// deployment because registry slot status may not have arrived yet.
+fn probe_route_authorization(
+    cfg: &Config,
+    target: &StreamingTarget,
+    provider: &Provider,
+    selected: &SelectedProbeModel,
+) -> Option<ProbeRouteAuthorization> {
+    let is_bedrock = provider.as_str() == REVIEWED_BEDROCK_PROVIDER
+        && target.worker_backends.get(provider).map(String::as_str) == Some("bedrock");
+    if !is_bedrock {
+        return Some(ProbeRouteAuthorization {
+            slot: selected.slot.clone(),
+            bedrock_mantle_route_marker: false,
+        });
+    }
+
+    if selected.model.fallback
+        || selected.model.canonical != REVIEWED_BEDROCK_MODEL
+        || selected.model.wire_model() != REVIEWED_BEDROCK_MODEL
+    {
+        return None;
+    }
+
+    let slot = if let Some(worker_models) = target.provider_models.as_ref() {
+        let slot = selected.slot.as_deref()?;
+        let verified_models = worker_models.get(provider)?.by_slot.get(slot)?;
+        if !verified_models.contains(REVIEWED_BEDROCK_MODEL) {
+            return None;
+        }
+        slot.to_owned()
+    } else {
+        let keys = cfg.provider_keys.as_ref()?;
+        if keys.anthropic_upstream.as_deref() != Some("bedrock")
+            || keys.bedrock_region.as_deref() != Some("us-east-1")
+        {
+            return None;
+        }
+        let key = keys.bedrock_api_key.as_deref()?;
+        if key.trim().is_empty() {
+            return None;
+        }
+        let mut slots = parse_key_slots("anthropic", key, &target.node_secret).ok()?;
+        if slots.len() != 1 {
+            return None;
+        }
+        slots.remove(0).id
+    };
+
+    Some(ProbeRouteAuthorization {
+        slot: Some(slot),
+        bedrock_mantle_route_marker: true,
+    })
 }
 
 async fn resolve_primary_worker(cfg: &Config) -> Result<StreamingTarget> {
@@ -840,6 +919,7 @@ fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> 
             model: model.canonical.clone(),
             slot,
             fallback: model.fallback,
+            bedrock_mantle_route_marker: false,
             path: "/v1/messages",
             body: serde_json::json!({
                 "model": model.wire_model(),
@@ -877,6 +957,7 @@ fn openai_compatible_probe(
         model: model.canonical.clone(),
         slot,
         fallback: model.fallback,
+        bedrock_mantle_route_marker: false,
         path,
         body: serde_json::json!({
             "model": model.wire_model(),
@@ -911,6 +992,9 @@ async fn run_provider_probe(
         request = request.header("x-gm-upstream-model", selector);
     }
     request = apply_upstream_slot(request, probe.slot.as_deref());
+    if probe.bedrock_mantle_route_marker {
+        request = request.header(BEDROCK_MANTLE_ROUTE_HEADER, BEDROCK_MANTLE_ROUTE_MARKER);
+    }
     let mut response = request
         .json(&probe.body)
         .send()
@@ -1209,6 +1293,7 @@ mod tests {
             model: "zai/glm-5.3-tee".to_owned(),
             slot: None,
             fallback: false,
+            bedrock_mantle_route_marker: false,
             path: "/v1/chat/completions",
             body: serde_json::json!({"model": "z-ai/glm-5.3", "stream": true}),
         };
@@ -1227,6 +1312,253 @@ mod tests {
     fn classify_clearly_streaming_timing_as_streaming() {
         let offsets = [ms(250), ms(620), ms(980), ms(1_360), ms(1_720)];
         assert_eq!(classify_streaming(&offsets), StreamingVerdict::Streaming);
+    }
+
+    fn bedrock_config(key: &str) -> Config {
+        Config {
+            provider_keys: Some(ProviderKeys {
+                anthropic_upstream: Some("bedrock".to_owned()),
+                bedrock_region: Some("us-east-1".to_owned()),
+                bedrock_api_key: Some(key.to_owned()),
+                ..ProviderKeys::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn bedrock_model() -> ProbeModel {
+        ProbeModel {
+            canonical: REVIEWED_BEDROCK_MODEL.to_owned(),
+            upstream: Some(REVIEWED_BEDROCK_MODEL.to_owned()),
+            fallback: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_bedrock_probe_sends_marker_and_registry_verified_slot() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let node_secret = "selected-worker-node-secret";
+        let slot = gm_miner_cli::slots::derive_slot_id(
+            REVIEWED_BEDROCK_PROVIDER,
+            "configured-bedrock-key",
+            node_secret,
+        )
+        .expect("HMAC slot");
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-gm-provider", REVIEWED_BEDROCK_PROVIDER))
+            .and(header("x-gm-upstream-slot", slot.as_str()))
+            .and(header(
+                BEDROCK_MANTLE_ROUTE_HEADER,
+                BEDROCK_MANTLE_ROUTE_MARKER,
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {}\n\ndata: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: node_secret.to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                ProviderModelCoverage {
+                    unscoped: BTreeSet::new(),
+                    by_slot: HashMap::from([(
+                        slot.clone(),
+                        BTreeSet::from([REVIEWED_BEDROCK_MODEL.to_owned()]),
+                    )]),
+                },
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("worker model ownership")
+            .remove(0);
+        let route =
+            probe_route_authorization(&Config::default(), &target, &Provider::Anthropic, &selected)
+                .expect("verified Bedrock slot authorizes marker");
+        assert_eq!(route.slot.as_deref(), Some(slot.as_str()));
+        assert!(route.bedrock_mantle_route_marker);
+
+        let mut probe = build_probe(Provider::Anthropic, &selected.model, route.slot);
+        probe.bedrock_mantle_route_marker = route.bedrock_mantle_route_marker;
+        assert_eq!(probe.body["model"], REVIEWED_BEDROCK_MODEL);
+        run_provider_probe(&target, &probe)
+            .await
+            .expect("mock requires route marker and verified slot");
+    }
+
+    #[test]
+    fn post_deploy_bedrock_probe_derives_only_the_configured_single_slot() {
+        let cfg = bedrock_config("just-deployed-bedrock-key");
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "just-deployed-node-secret".to_owned(),
+            provider_models: None,
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("post-deploy configuration is authoritative")
+            .remove(0);
+        assert_eq!(selected.slot, None);
+
+        let route = probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected)
+            .expect("derive the just-deployed slot");
+        let expected = gm_miner_cli::slots::derive_slot_id(
+            REVIEWED_BEDROCK_PROVIDER,
+            "just-deployed-bedrock-key",
+            "just-deployed-node-secret",
+        )
+        .expect("HMAC slot");
+        assert_eq!(route.slot.as_deref(), Some(expected.as_str()));
+        assert!(route.bedrock_mantle_route_marker);
+    }
+
+    #[tokio::test]
+    async fn bedrock_probe_is_inconclusive_without_verified_or_derivable_slot() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let cfg = bedrock_config("configured-key");
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                unscoped_coverage(&[REVIEWED_BEDROCK_MODEL]),
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("provider-wide models are known")
+            .remove(0);
+        assert_eq!(selected.slot, None);
+        assert!(
+            probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected).is_none()
+        );
+        let catalog = ProbeModels {
+            models: HashMap::from([(Provider::Anthropic, vec![bedrock_model()])]),
+        };
+        check_provider_streaming(
+            &cfg,
+            &target,
+            Provider::Anthropic,
+            &catalog,
+            &BTreeSet::new(),
+        )
+        .await;
+        assert!(server
+            .received_requests()
+            .await
+            .expect("request count")
+            .is_empty());
+
+        let mut missing_key = bedrock_config("");
+        let target = StreamingTarget {
+            provider_models: None,
+            ..target
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("model is canonical")
+            .remove(0);
+        missing_key
+            .provider_keys
+            .as_mut()
+            .expect("keys")
+            .bedrock_api_key = None;
+        assert!(
+            probe_route_authorization(&missing_key, &target, &Provider::Anthropic, &selected)
+                .is_none()
+        );
+        check_provider_streaming(
+            &missing_key,
+            &target,
+            Provider::Anthropic,
+            &catalog,
+            &BTreeSet::new(),
+        )
+        .await;
+        assert!(server
+            .received_requests()
+            .await
+            .expect("request count")
+            .is_empty());
+
+        let foundry = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                unscoped_coverage(&[REVIEWED_BEDROCK_MODEL]),
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "foundry".to_owned())]),
+        };
+        check_provider_streaming(
+            &cfg,
+            &foundry,
+            Provider::Anthropic,
+            &catalog,
+            &BTreeSet::new(),
+        )
+        .await;
+        assert!(server
+            .received_requests()
+            .await
+            .expect("request count")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_anthropic_probe_never_sends_bedrock_route_marker() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(|request: &wiremock::Request| {
+                !request.headers.contains_key(BEDROCK_MANTLE_ROUTE_HEADER)
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {}\n\ndata: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The global configuration may select Bedrock for a sibling worker;
+        // this selected worker's direct backend remains authoritative.
+        let cfg = bedrock_config("sibling-bedrock-key");
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                unscoped_coverage(&[REVIEWED_BEDROCK_MODEL]),
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "direct".to_owned())]),
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("direct worker can probe its canonical model")
+            .remove(0);
+        let route = probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected)
+            .expect("ordinary direct route");
+        assert!(!route.bedrock_mantle_route_marker);
+        let mut probe = build_probe(Provider::Anthropic, &selected.model, route.slot);
+        probe.bedrock_mantle_route_marker = route.bedrock_mantle_route_marker;
+        run_provider_probe(&target, &probe)
+            .await
+            .expect("direct request has no Bedrock marker");
     }
 
     #[test]
