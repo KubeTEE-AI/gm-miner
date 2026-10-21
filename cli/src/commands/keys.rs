@@ -15,8 +15,8 @@ pub(crate) struct SetApiKeysArgs {
 
     /// Anthropic transport selector: direct, bedrock, or foundry.
     /// Foundry uses the ARM-verified model binding; cloud operations also require
-    /// the registry capability `upstream-model-echo`. Bedrock remains a
-    /// disabled inference transport in this image.
+    /// the registry capability `upstream-model-echo`. Bedrock uses the approved
+    /// Mantle image and the network's registry-authorized model bindings.
     #[arg(long)]
     anthropic_upstream: Option<String>,
 

@@ -37,6 +37,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
+use crate::bedrock_bindings::BEDROCK_MANTLE_IMAGE_FEATURE;
 use crate::deploy::normalize_hash;
 use crate::network::Network;
 
@@ -77,9 +78,10 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 8] = [
+pub const IMAGE_FEATURES: [&str; 9] = [
     "upstream-key-slots",
     "upstream-model-hop",
+    BEDROCK_MANTLE_IMAGE_FEATURE,
     "deepinfra-native-images",
     "chutes-verified-chat",
     "kubetee-attested-chat",
@@ -444,6 +446,7 @@ mod tests {
             serde_json::json!([
                 "upstream-key-slots",
                 "upstream-model-hop",
+                BEDROCK_MANTLE_IMAGE_FEATURE,
                 "deepinfra-native-images",
                 "chutes-verified-chat",
                 "kubetee-attested-chat",

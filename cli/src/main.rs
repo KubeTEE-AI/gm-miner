@@ -159,7 +159,7 @@ enum Command {
         gmcli set-api-keys --kubetee sk-...\n  \
         gmcli set-api-keys --engy sk-...\n  \
         gmcli set-api-keys --moonmath sk-...\n  \
-        gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-west-2 \\\n  \
+        gmcli set-api-keys --anthropic-upstream bedrock --bedrock-region us-east-1 \\\n  \
           --bedrock-api-key brk-...\n  \
         gmcli set-api-keys --openai-upstream azure --azure-openai-endpoint https://my-resource.openai.azure.com \\\n  \
           --azure-openai-api-key ...\n  \
@@ -342,8 +342,7 @@ enum Command {
     /// cache, audio, image and long-context rates where the model has them — and
     /// asks you to confirm the discount.
     #[command(after_help = "Examples:\n  \
-        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
-        gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model anthropic.claude-sonnet-4-6-v1\n  \
+        gmcli declare-product --provider anthropic --model claude-opus-4-8 --discount-pct 5\n  \
         gmcli declare-product --provider openai --model gpt-5.5 --discount-pct 10.5\n  \
         gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5   # a sourcing route; see `gmcli sources`")]
     DeclareProduct {
@@ -356,9 +355,8 @@ enum Command {
         #[arg(long)]
         model: String,
 
-        /// Legacy upstream model id for transport diagnostics. Cloud offers use
-        /// the canonical model id after the image and registry gates pass; the
-        /// deployment must use the canonical model name.
+        /// Legacy upstream model id for transport diagnostics. Bedrock selector
+        /// mappings come from the network's registry; omit this option.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
 
@@ -1887,13 +1885,13 @@ mod tests {
             "gmcli",
             "declare-product",
             "--provider",
-            "anthropic",
+            "openai",
             "--model",
-            "claude-sonnet-4-6",
+            "gpt-5.5",
             "--discount-pct",
             "5",
             "--upstream-model",
-            "anthropic.claude-sonnet-4-6-v1",
+            "deployment-gpt-55",
         ])
         .unwrap();
 
@@ -1902,7 +1900,7 @@ mod tests {
             Command::DeclareProduct {
                 upstream_model: Some(ref upstream_model),
                 ..
-            } if upstream_model == "anthropic.claude-sonnet-4-6-v1"
+            } if upstream_model == "deployment-gpt-55"
         ));
     }
 

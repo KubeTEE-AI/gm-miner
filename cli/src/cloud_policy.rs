@@ -15,16 +15,6 @@ use crate::{
     types::{MinerStatus, WorkerEntry, WorkerListResponse},
 };
 
-/// The only Bedrock model-ID tuple currently covered by registry normalization.
-/// This does not authorize the worker's cloud transport.
-pub const REVIEWED_BEDROCK_PROVIDER: &str = "anthropic";
-pub const REVIEWED_BEDROCK_MODEL: &str = "claude-sonnet-4-6";
-pub const REVIEWED_BEDROCK_UPSTREAM_MODEL: &str = "anthropic.claude-sonnet-4-6-v1";
-/// Legacy AWS Bedrock model id accepted from offers written before Mantle
-/// model ids were canonicalized. It normalizes to [`REVIEWED_BEDROCK_UPSTREAM_MODEL`]
-/// only for the exact reviewed provider/model pair.
-pub const LEGACY_BEDROCK_UPSTREAM_MODEL: &str = "us.anthropic.claude-sonnet-4-6-v1";
-
 /// The declaration decision has two independent consequences. A live worker
 /// may need the registry's model-echo compatibility check while still being
 /// a known-direct worker that is safe to keep in a bulk declaration.
@@ -49,38 +39,6 @@ impl CloudDeclarationPolicy {
         requires_capability: true,
         exclude_from_bulk: false,
     };
-}
-
-/// Normalize an accepted Bedrock model id to the current Mantle id.
-///
-/// Returning `None` is intentional for every other model/provider/id
-/// combination: transport compatibility alone is not an admission binding.
-#[must_use]
-pub fn normalize_bedrock_upstream_model(
-    provider: &str,
-    model: &str,
-    upstream_model: &str,
-) -> Option<&'static str> {
-    if provider == REVIEWED_BEDROCK_PROVIDER
-        && model == REVIEWED_BEDROCK_MODEL
-        && matches!(
-            upstream_model,
-            REVIEWED_BEDROCK_UPSTREAM_MODEL | LEGACY_BEDROCK_UPSTREAM_MODEL
-        )
-    {
-        Some(REVIEWED_BEDROCK_UPSTREAM_MODEL)
-    } else {
-        None
-    }
-}
-
-/// Return true only for the exact Bedrock provider/model/upstream tuple the
-/// registry recognizes for legacy diagnostics. This is not routing admission;
-/// the worker's actual backend also needs independently verified provenance.
-#[must_use]
-pub fn is_reviewed_bedrock_binding(provider: &str, model: &str, upstream_model: &str) -> bool {
-    normalize_bedrock_upstream_model(provider, model, upstream_model)
-        == Some(REVIEWED_BEDROCK_UPSTREAM_MODEL)
 }
 
 /// The explicitly selected cloud adapter for `provider` in the local config.
@@ -312,50 +270,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, NetworkEntry, ProviderKeys, WorkerRecord};
     use std::collections::{BTreeMap, HashMap};
-
-    #[test]
-    fn only_the_reviewed_bedrock_tuple_is_recognized() {
-        assert!(is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-sonnet-4-6",
-            "anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-sonnet-4-6",
-            "anthropic.claude-sonnet-4-6-v2"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-opus-4-7",
-            "anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "openai",
-            "claude-sonnet-4-6",
-            "anthropic.claude-sonnet-4-6-v1"
-        ));
-    }
-
-    #[test]
-    fn legacy_reviewed_bedrock_id_normalizes_to_the_mantle_id() {
-        assert_eq!(
-            normalize_bedrock_upstream_model(
-                "anthropic",
-                "claude-sonnet-4-6",
-                LEGACY_BEDROCK_UPSTREAM_MODEL,
-            ),
-            Some(REVIEWED_BEDROCK_UPSTREAM_MODEL)
-        );
-        assert_eq!(
-            normalize_bedrock_upstream_model(
-                "anthropic",
-                "claude-opus-4-7",
-                LEGACY_BEDROCK_UPSTREAM_MODEL,
-            ),
-            None
-        );
-    }
 
     #[test]
     fn selected_cloud_adapter_blocks_bulk_supply() {

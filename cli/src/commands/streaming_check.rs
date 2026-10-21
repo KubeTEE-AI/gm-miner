@@ -7,12 +7,16 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
+    bedrock_bindings::{
+        fetch_bedrock_model_bindings, BedrockModelBinding, MODEL_BINDING_REVISION_HEADER,
+    },
     client::{
         build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH,
         VIDEO_JOBS_HEADER,
     },
-    cloud_policy::normalize_bedrock_upstream_model,
     config::{Config, ProviderKeys, WorkerRecord},
+    deploy::{fetch_supported_versions, normalize_hash, ImageVersion},
+    slots::parse_key_slots,
     types::{
         MinerStatus, Product, ProductCatalogResponse, Provider, SourceProduct, WorkerEntry,
         WorkerListResponse,
@@ -32,6 +36,9 @@ const BUFFERED_BURST_SPAN: Duration = Duration::from_millis(250);
 const BUFFERED_FIRST_WAIT: Duration = Duration::from_secs(1);
 const BUFFERED_RATIO: f64 = 0.20;
 const MAX_TOKENS: u32 = 32;
+const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+const EXACT_CANONICAL_NO_REPLAY_POLICY: &str = "exact-canonical-no-replay-v1";
+const BEDROCK_PROVIDER: &str = "anthropic";
 
 const BUFFERED_GUIDANCE: &str = "Your {provider} upstream returned a buffered response: \
 the whole completion arrived in one burst instead of token-by-token. Buyers see slow \
@@ -53,7 +60,7 @@ enum StreamingVerdict {
     Inconclusive,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StreamingTarget {
     endpoint: String,
     node_secret: String,
@@ -67,6 +74,11 @@ struct StreamingTarget {
     /// miner-scoped offer carries a cloud upstream id. Cloud bindings are
     /// resolved against this map, never against the offer alone.
     worker_backends: HashMap<Provider, String>,
+    /// True only when the selected worker's measured compose hash maps to a
+    /// currently supported image carrying the execution-policy runtime stamp.
+    /// The immediate post-deploy advisory receives the already hash-verified
+    /// approval directly.
+    bedrock_policy_image_capable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,6 +94,10 @@ struct ProviderProbe {
     model: String,
     slot: Option<String>,
     fallback: bool,
+    /// Versioned runtime policy. Set only after the selected worker's image,
+    /// exact model, backend, and authorized key slot are proven.
+    execution_policy: Option<&'static str>,
+    model_binding_revision: Option<u64>,
     path: &'static str,
     body: Value,
 }
@@ -119,6 +135,8 @@ struct ProbeModel {
     canonical: String,
     upstream: Option<String>,
     fallback: bool,
+    /// Captured from the fixed registry binding snapshot, never from offers.
+    binding_revision: Option<u64>,
 }
 
 impl ProbeModel {
@@ -135,6 +153,12 @@ struct ProbeTiming {
     last: Duration,
     span: Duration,
     chunks: usize,
+}
+
+struct ProbeRouteAuthorization {
+    slot: Option<String>,
+    execution_policy: Option<&'static str>,
+    model_binding_revision: Option<u64>,
 }
 
 /// Runs the standalone streaming self-test against the miner's primary worker.
@@ -154,7 +178,12 @@ pub(crate) async fn cmd_check_streaming(cfg: Config) -> Result<()> {
 /// Deploy already has the fresh endpoint and node secret in hand, so this path
 /// avoids an extra registry lookup. Any error is printed as guidance and never
 /// fails the deploy that just succeeded.
-pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node_secret: &str) {
+pub(crate) async fn deploy_streaming_advisory(
+    cfg: &Config,
+    endpoint: &str,
+    node_secret: &str,
+    bedrock_policy_image_capable: bool,
+) {
     println!("\nStreaming self-test (advisory) ...");
     let target = StreamingTarget {
         endpoint: endpoint.to_owned(),
@@ -165,6 +194,7 @@ pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node
             .as_ref()
             .map(|keys| backends_from_config(&keys.worker_backends()))
             .unwrap_or_default(),
+        bedrock_policy_image_capable,
     };
     run_streaming_checks(cfg, &target).await;
 }
@@ -198,14 +228,59 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
     let canonical = canonical_models(&catalog, &providers);
     let routes = fetch_routes(cfg).await;
     let excluded = non_chat_probe_exclusions(&catalog, &routes);
-    let model_catalog = resolve_probe_models(
+    let mut model_catalog = resolve_probe_models(
         &providers,
         &canonical,
         declared.as_ref().unwrap_or(&empty_declared),
     );
-    for provider in providers {
-        check_provider_streaming(target, provider, &model_catalog, &excluded).await;
+    if target
+        .worker_backends
+        .get(&Provider::Anthropic)
+        .map(String::as_str)
+        == Some("bedrock")
+    {
+        if let Ok(bindings) = fetch_bedrock_model_bindings(cfg.resolved_network()).await {
+            let eligible = canonical
+                .get(&Provider::Anthropic)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            model_catalog.models.insert(
+                Provider::Anthropic,
+                bedrock_probe_models(&bindings, eligible),
+            );
+        } else {
+            println!(
+                "  [--] anthropic: fixed registry model bindings are unavailable; no Bedrock probe sent"
+            );
+            model_catalog.models.insert(Provider::Anthropic, Vec::new());
+        }
     }
+    for provider in providers {
+        check_provider_streaming(cfg, target, provider, &model_catalog, &excluded).await;
+    }
+}
+
+/// Use the registry snapshot as the only Bedrock model selector. Intersect its
+/// bindings with active buyer products so diagnostics don't probe withdrawn or
+/// unpublished models, and carry the registry row revision into the request.
+fn bedrock_probe_models(
+    bindings: &[BedrockModelBinding],
+    active_products: &[String],
+) -> Vec<ProbeModel> {
+    let active = active_products
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    bindings
+        .iter()
+        .filter(|binding| active.contains(binding.model.as_str()))
+        .map(|binding| ProbeModel {
+            canonical: binding.model.clone(),
+            upstream: None,
+            fallback: false,
+            binding_revision: Some(binding.revision),
+        })
+        .collect()
 }
 
 fn warn_missing_provider_keys(
@@ -251,6 +326,7 @@ fn warn_unreadable_declarations(providers: &[Provider]) {
 }
 
 async fn check_provider_streaming(
+    cfg: &Config,
     target: &StreamingTarget,
     provider: Provider,
     model_catalog: &ProbeModels,
@@ -278,6 +354,16 @@ async fn check_provider_streaming(
         }
         return;
     }
+    if provider.as_str() == BEDROCK_PROVIDER
+        && target.worker_backends.get(&provider).map(String::as_str) == Some("bedrock")
+        && !target.bedrock_policy_image_capable
+    {
+        println!(
+            "  [--] {provider}: selected worker's measured image is not \
+             approved for the current execution policy; no policy probe sent"
+        );
+        return;
+    }
     for selected in models {
         if excluded.contains(&(
             provider.as_str().to_owned(),
@@ -289,10 +375,82 @@ async fn check_provider_streaming(
             );
             continue;
         }
-        let probe = build_probe(provider.clone(), &selected.model, selected.slot);
+        let Some(route) = probe_route_authorization(cfg, target, &provider, &selected) else {
+            println!(
+                "  [--] {provider}/{}: exact Bedrock route slot is not verified or derivable; \
+                 no streaming probe sent",
+                selected.model.canonical
+            );
+            continue;
+        };
+        let mut probe = build_probe(provider.clone(), &selected.model, route.slot);
+        probe.execution_policy = route.execution_policy;
+        probe.model_binding_revision = route.model_binding_revision;
         let result = run_provider_probe(target, &probe).await;
         print_probe_result(&probe, result);
     }
+}
+
+/// Authorize the versioned execution policy only when the current image and
+/// this probe have an exact Bedrock backend/model/slot binding. Standalone
+/// checks use the selected worker's registry-verified slot ownership; the
+/// immediate post-deploy advisory derives the slot from the key and node
+/// secret used for that deployment because registry slot status may not have
+/// arrived yet.
+fn probe_route_authorization(
+    cfg: &Config,
+    target: &StreamingTarget,
+    provider: &Provider,
+    selected: &SelectedProbeModel,
+) -> Option<ProbeRouteAuthorization> {
+    let is_bedrock = provider.as_str() == BEDROCK_PROVIDER
+        && target.worker_backends.get(provider).map(String::as_str) == Some("bedrock");
+    if !is_bedrock {
+        return Some(ProbeRouteAuthorization {
+            slot: selected.slot.clone(),
+            execution_policy: None,
+            model_binding_revision: None,
+        });
+    }
+
+    if !target.bedrock_policy_image_capable
+        || selected.model.fallback
+        || selected.model.binding_revision.is_none()
+        || selected.model.wire_model() != selected.model.canonical
+    {
+        return None;
+    }
+
+    let slot = if let Some(worker_models) = target.provider_models.as_ref() {
+        let slot = selected.slot.as_deref()?;
+        let verified_models = worker_models.get(provider)?.by_slot.get(slot)?;
+        if !verified_models.contains(&selected.model.canonical) {
+            return None;
+        }
+        slot.to_owned()
+    } else {
+        let keys = cfg.provider_keys.as_ref()?;
+        if keys.anthropic_upstream.as_deref() != Some("bedrock")
+            || keys.bedrock_region.as_deref() != Some("us-east-1")
+        {
+            return None;
+        }
+        let key = keys.bedrock_api_key.as_deref()?;
+        if key.trim().is_empty() {
+            return None;
+        }
+        let mut slots = parse_key_slots("anthropic", key, &target.node_secret).ok()?;
+        if slots.len() != 1 {
+            return None;
+        }
+        slots.remove(0).id
+    };
+
+    Some(ProbeRouteAuthorization {
+        slot: Some(slot),
+        execution_policy: Some(EXACT_CANONICAL_NO_REPLAY_POLICY),
+        model_binding_revision: selected.model.binding_revision,
+    })
 }
 
 async fn resolve_primary_worker(cfg: &Config) -> Result<StreamingTarget> {
@@ -321,7 +479,37 @@ async fn resolve_primary_worker(cfg: &Config) -> Result<StreamingTarget> {
     }
     let workers: WorkerListResponse = resp.json().await.context("parse worker list response")?;
 
-    pick_target_worker(local, &workers.workers)
+    let mut target = pick_target_worker(local, &workers.workers)?;
+    if target
+        .worker_backends
+        .get(&Provider::Anthropic)
+        .map(String::as_str)
+        == Some("bedrock")
+    {
+        let current_compose_hash = first_live_worker_id(&workers.workers)
+            .and_then(|worker_id| {
+                workers
+                    .workers
+                    .iter()
+                    .find(|worker| worker.worker_id == worker_id)
+            })
+            .and_then(|worker| worker.image_compose_hash.as_deref())
+            .map(str::to_owned);
+        if let Some(compose_hash) = current_compose_hash {
+            match fetch_supported_versions(&cfg.api_url()).await {
+                Ok(versions) => {
+                    target.bedrock_policy_image_capable =
+                        image_has_bedrock_policy_feature(Some(&compose_hash), &versions);
+                }
+                // `fetch_supported_versions` includes response bodies in some
+                // errors. Keep registry error details out of CLI diagnostics.
+                Err(_) => {
+                    tracing::warn!("could not verify the selected Bedrock worker image feature");
+                }
+            }
+        }
+    }
+    Ok(target)
 }
 
 /// Pick which worker `check-streaming` probes: the oldest worker the
@@ -369,7 +557,36 @@ fn pick_target_worker(local: &[WorkerRecord], live: &[WorkerEntry]) -> Result<St
             .as_ref()
             .map(backends_from_config)
             .unwrap_or_default(),
+        bedrock_policy_image_capable: false,
     })
+}
+
+fn image_has_bedrock_policy_feature(
+    image_compose_hash: Option<&str>,
+    versions: &[ImageVersion],
+) -> bool {
+    let Some(image_compose_hash) = image_compose_hash else {
+        return false;
+    };
+    let image_compose_hash = normalize_hash(image_compose_hash);
+    if !is_sha256_hex(&image_compose_hash) {
+        return false;
+    }
+    let matching = versions
+        .iter()
+        .filter(|version| normalize_hash(&version.compose_hash) == image_compose_hash)
+        .collect::<Vec<_>>();
+    !matching.is_empty()
+        && matching.iter().all(|version| {
+            let version_hash = normalize_hash(&version.compose_hash);
+            version.status == "supported"
+                && is_sha256_hex(&version_hash)
+                && version.bedrock_mantle_model_bindings_capable()
+        })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn backends_from_config(
@@ -495,9 +712,10 @@ fn models_for_target(
 ///
 /// Offers are miner-scoped, so their `upstream_model` cannot be used blindly:
 /// a direct worker must send the canonical id even when a sibling Bedrock
-/// worker's offer carries a deployment id. Bedrock accepts only the reviewed
-/// canonical/legacy ids; Azure, Foundry, and unknown cloud backends stay
-/// unverified until an authoritative binding exists.
+/// worker's offer carries a deployment id. Bedrock accepts only models present
+/// in the fixed registry snapshot; the adapter owns the AWS selector rewrite.
+/// Azure, Foundry, and unknown cloud backends stay unverified until an
+/// authoritative binding exists.
 fn bind_models_to_worker(
     target: &StreamingTarget,
     provider: &Provider,
@@ -508,19 +726,22 @@ fn bind_models_to_worker(
             .into_iter()
             .map(|mut model| {
                 model.upstream = None;
+                model.binding_revision = None;
                 model
             })
             .collect(),
         Some("bedrock") => models
             .into_iter()
             .filter_map(|mut model| {
-                let upstream = model.upstream.as_deref()?;
-                let normalized = normalize_bedrock_upstream_model(
-                    provider.as_str(),
-                    &model.canonical,
-                    upstream,
-                )?;
-                model.upstream = Some(normalized.to_owned());
+                if provider.as_str() != BEDROCK_PROVIDER
+                    || model.binding_revision.is_none()
+                    || model.fallback
+                {
+                    return None;
+                }
+                // The binding row revision proves model admission; the adapter
+                // owns the selector rewrite and ignores any offer mapping.
+                model.upstream = None;
                 Some(model)
             })
             .collect(),
@@ -623,6 +844,7 @@ impl ProbeModels {
                 canonical: fallback_model(provider).to_owned(),
                 upstream: None,
                 fallback: true,
+                binding_revision: None,
             }],
         }
     }
@@ -665,6 +887,7 @@ fn resolve_probe_models(
                         .filter(|offer| offer.is_offered)
                         .and_then(|offer| offer.upstream_model.clone()),
                     fallback: false,
+                    binding_revision: None,
                 })
                 .collect();
             models.insert(provider.clone(), provider_models);
@@ -805,6 +1028,7 @@ fn declared_models_for_provider(
             canonical,
             upstream: offer.upstream_model,
             fallback: false,
+            binding_revision: None,
         })
         .collect()
 }
@@ -834,6 +1058,8 @@ fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> 
             model: model.canonical.clone(),
             slot,
             fallback: model.fallback,
+            execution_policy: None,
+            model_binding_revision: model.binding_revision,
             path: "/v1/messages",
             body: serde_json::json!({
                 "model": model.wire_model(),
@@ -871,6 +1097,8 @@ fn openai_compatible_probe(
         model: model.canonical.clone(),
         slot,
         fallback: model.fallback,
+        execution_policy: None,
+        model_binding_revision: None,
         path,
         body: serde_json::json!({
             "model": model.wire_model(),
@@ -905,6 +1133,12 @@ async fn run_provider_probe(
         request = request.header("x-gm-upstream-model", selector);
     }
     request = apply_upstream_slot(request, probe.slot.as_deref());
+    if let Some(execution_policy) = probe.execution_policy {
+        request = request.header(EXECUTION_POLICY_HEADER, execution_policy);
+    }
+    if let Some(revision) = probe.model_binding_revision {
+        request = request.header(MODEL_BINDING_REVISION_HEADER, revision.to_string());
+    }
     let mut response = request
         .json(&probe.body)
         .send()
@@ -915,6 +1149,11 @@ async fn run_provider_probe(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         bail!("upstream returned {status}: {}", trim_body(&body));
+    }
+    if let Some(expected_revision) = probe.model_binding_revision {
+        if !response_confirms_binding_revision(response.headers(), expected_revision) {
+            bail!("Bedrock adapter response did not confirm the selected model-binding revision");
+        }
     }
 
     let mut parser = SseParser::default();
@@ -927,6 +1166,15 @@ async fn run_provider_probe(
         parser.push_chunk(&chunk, offset);
     }
     Ok(parser.finish())
+}
+
+fn response_confirms_binding_revision(headers: &reqwest::header::HeaderMap, expected: u64) -> bool {
+    let mut revisions = headers.get_all(MODEL_BINDING_REVISION_HEADER).iter();
+    let Some(revision) = revisions.next() else {
+        return false;
+    };
+    let expected = expected.to_string();
+    revision.to_str().ok() == Some(expected.as_str()) && revisions.next().is_none()
 }
 
 fn apply_upstream_slot(
@@ -1170,6 +1418,9 @@ fn fmt_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
 
+    const TEST_APPROVED_BEDROCK_MODEL: &str = "future-approved-bedrock-model";
+    const TEST_BEDROCK_BINDING_REVISION: u64 = 7;
+
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
     }
@@ -1197,12 +1448,15 @@ mod tests {
             node_secret: "secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let probe = ProviderProbe {
             provider: Provider::Kubetee,
             model: "zai/glm-5.3-tee".to_owned(),
             slot: None,
             fallback: false,
+            execution_policy: None,
+            model_binding_revision: None,
             path: "/v1/chat/completions",
             body: serde_json::json!({"model": "z-ai/glm-5.3", "stream": true}),
         };
@@ -1223,12 +1477,384 @@ mod tests {
         assert_eq!(classify_streaming(&offsets), StreamingVerdict::Streaming);
     }
 
+    fn bedrock_config(key: &str) -> Config {
+        Config {
+            provider_keys: Some(ProviderKeys {
+                anthropic_upstream: Some("bedrock".to_owned()),
+                bedrock_region: Some("us-east-1".to_owned()),
+                bedrock_api_key: Some(key.to_owned()),
+                ..ProviderKeys::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn bedrock_model() -> ProbeModel {
+        ProbeModel {
+            canonical: TEST_APPROVED_BEDROCK_MODEL.to_owned(),
+            upstream: Some("anthropic.operator-mapping-must-be-ignored".to_owned()),
+            fallback: false,
+            binding_revision: Some(TEST_BEDROCK_BINDING_REVISION),
+        }
+    }
+
+    fn image_version(compose_hash: &str, features: &[&str]) -> ImageVersion {
+        ImageVersion {
+            git_tag: None,
+            compose_hash: compose_hash.to_owned(),
+            os_image_hash: "os-hash".to_owned(),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2026-10-21T00:00:00Z".to_owned(),
+            image_ref: None,
+            features: features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bedrock_policy_feature_must_match_the_selected_current_image() {
+        let old_hash = "a".repeat(64);
+        let current_hash = "b".repeat(64);
+        let no_feature_hash = "c".repeat(64);
+        let blocked_hash = "d".repeat(64);
+        let old = image_version(&old_hash, &["bedrock-mantle-model-bindings-v0"]);
+        let current = image_version(&current_hash, &["bedrock-mantle-model-bindings-v1"]);
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&old_hash),
+            &[old.clone(), current.clone()]
+        ));
+        assert!(image_has_bedrock_policy_feature(
+            Some(&current_hash),
+            &[old.clone(), current.clone()]
+        ));
+
+        let no_feature = image_version(&no_feature_hash, &[]);
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&no_feature_hash),
+            &[no_feature]
+        ));
+
+        let mut blocked = image_version(&blocked_hash, &["bedrock-mantle-model-bindings-v1"]);
+        blocked.status = "blocked".to_owned();
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&blocked_hash),
+            &[blocked]
+        ));
+
+        // A duplicate compose hash is ambiguous if any matching row still
+        // carries the old measurement stamp.
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&current_hash),
+            &[
+                current.clone(),
+                image_version(&current_hash, &["bedrock-mantle-model-bindings-v0"]),
+            ]
+        ));
+
+        assert!(!image_has_bedrock_policy_feature(
+            None,
+            std::slice::from_ref(&current)
+        ));
+        assert!(!image_has_bedrock_policy_feature(
+            Some(""),
+            &[image_version("", &["bedrock-mantle-model-bindings-v1",])]
+        ));
+        assert!(!image_has_bedrock_policy_feature(
+            Some("not-a-sha256"),
+            &[image_version(
+                "not-a-sha256",
+                &["bedrock-mantle-model-bindings-v1"]
+            )],
+        ));
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&"e".repeat(64)),
+            &[image_version(
+                &current_hash,
+                &["bedrock-mantle-model-bindings-v1"]
+            )],
+        ));
+    }
+
+    #[tokio::test]
+    async fn qualified_bedrock_probe_sends_execution_policy_and_registry_verified_slot() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let node_secret = "selected-worker-node-secret";
+        let slot = gm_miner_cli::slots::derive_slot_id(
+            BEDROCK_PROVIDER,
+            "configured-bedrock-key",
+            node_secret,
+        )
+        .expect("HMAC slot");
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-gm-provider", BEDROCK_PROVIDER))
+            .and(header("x-gm-upstream-slot", slot.as_str()))
+            .and(header(
+                MODEL_BINDING_REVISION_HEADER,
+                TEST_BEDROCK_BINDING_REVISION.to_string(),
+            ))
+            .and(header(
+                EXECUTION_POLICY_HEADER,
+                EXACT_CANONICAL_NO_REPLAY_POLICY,
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header(
+                        MODEL_BINDING_REVISION_HEADER,
+                        TEST_BEDROCK_BINDING_REVISION.to_string(),
+                    )
+                    .set_body_string("data: {}\n\ndata: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: node_secret.to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                ProviderModelCoverage {
+                    unscoped: BTreeSet::new(),
+                    by_slot: HashMap::from([(
+                        slot.clone(),
+                        BTreeSet::from([TEST_APPROVED_BEDROCK_MODEL.to_owned()]),
+                    )]),
+                },
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: true,
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("worker model ownership")
+            .remove(0);
+        let mut stale_image = target.clone();
+        stale_image.bedrock_policy_image_capable = false;
+        assert!(probe_route_authorization(
+            &Config::default(),
+            &stale_image,
+            &Provider::Anthropic,
+            &selected
+        )
+        .is_none());
+        let route =
+            probe_route_authorization(&Config::default(), &target, &Provider::Anthropic, &selected)
+                .expect("current image and verified Bedrock slot authorize policy");
+        assert_eq!(route.slot.as_deref(), Some(slot.as_str()));
+        assert_eq!(
+            route.execution_policy,
+            Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
+        );
+        assert_eq!(
+            route.model_binding_revision,
+            Some(TEST_BEDROCK_BINDING_REVISION)
+        );
+
+        let mut probe = build_probe(Provider::Anthropic, &selected.model, route.slot);
+        probe.execution_policy = route.execution_policy;
+        probe.model_binding_revision = route.model_binding_revision;
+        assert_eq!(probe.body["model"], TEST_APPROVED_BEDROCK_MODEL);
+        run_provider_probe(&target, &probe)
+            .await
+            .expect("mock requires execution policy and verified slot");
+        check_provider_streaming(
+            &Config::default(),
+            &stale_image,
+            Provider::Anthropic,
+            &ProbeModels {
+                models: HashMap::from([(Provider::Anthropic, vec![bedrock_model()])]),
+            },
+            &BTreeSet::new(),
+        )
+        .await;
+    }
+
+    #[test]
+    fn post_deploy_bedrock_probe_derives_only_the_configured_single_slot() {
+        let cfg = bedrock_config("just-deployed-bedrock-key");
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "just-deployed-node-secret".to_owned(),
+            provider_models: None,
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: true,
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("post-deploy configuration is authoritative")
+            .remove(0);
+        assert_eq!(selected.slot, None);
+
+        let route = probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected)
+            .expect("derive the just-deployed slot");
+        let expected = gm_miner_cli::slots::derive_slot_id(
+            BEDROCK_PROVIDER,
+            "just-deployed-bedrock-key",
+            "just-deployed-node-secret",
+        )
+        .expect("HMAC slot");
+        assert_eq!(route.slot.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            route.execution_policy,
+            Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_probe_is_inconclusive_without_verified_or_derivable_slot() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let cfg = bedrock_config("configured-key");
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                unscoped_coverage(&[TEST_APPROVED_BEDROCK_MODEL]),
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: true,
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("provider-wide models are known")
+            .remove(0);
+        assert_eq!(selected.slot, None);
+        assert!(
+            probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected).is_none()
+        );
+        let catalog = ProbeModels {
+            models: HashMap::from([(Provider::Anthropic, vec![bedrock_model()])]),
+        };
+        check_provider_streaming(
+            &cfg,
+            &target,
+            Provider::Anthropic,
+            &catalog,
+            &BTreeSet::new(),
+        )
+        .await;
+        assert!(server
+            .received_requests()
+            .await
+            .expect("request count")
+            .is_empty());
+
+        let mut missing_key = bedrock_config("");
+        let target = StreamingTarget {
+            provider_models: None,
+            ..target
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("model is canonical")
+            .remove(0);
+        missing_key
+            .provider_keys
+            .as_mut()
+            .expect("keys")
+            .bedrock_api_key = None;
+        assert!(
+            probe_route_authorization(&missing_key, &target, &Provider::Anthropic, &selected)
+                .is_none()
+        );
+        check_provider_streaming(
+            &missing_key,
+            &target,
+            Provider::Anthropic,
+            &catalog,
+            &BTreeSet::new(),
+        )
+        .await;
+        assert!(server
+            .received_requests()
+            .await
+            .expect("request count")
+            .is_empty());
+
+        let foundry = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                unscoped_coverage(&[TEST_APPROVED_BEDROCK_MODEL]),
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "foundry".to_owned())]),
+            bedrock_policy_image_capable: false,
+        };
+        check_provider_streaming(
+            &cfg,
+            &foundry,
+            Provider::Anthropic,
+            &catalog,
+            &BTreeSet::new(),
+        )
+        .await;
+        assert!(server
+            .received_requests()
+            .await
+            .expect("request count")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_anthropic_probe_never_sends_execution_policy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(|request: &wiremock::Request| {
+                !request.headers.contains_key(EXECUTION_POLICY_HEADER)
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {}\n\ndata: [DONE]\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The global configuration may select Bedrock for a sibling worker;
+        // this selected worker's direct backend remains authoritative.
+        let cfg = bedrock_config("sibling-bedrock-key");
+        let target = StreamingTarget {
+            endpoint: server.uri(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Anthropic,
+                unscoped_coverage(&[TEST_APPROVED_BEDROCK_MODEL]),
+            )])),
+            worker_backends: HashMap::from([(Provider::Anthropic, "direct".to_owned())]),
+            bedrock_policy_image_capable: false,
+        };
+        let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
+            .expect("direct worker can probe its canonical model")
+            .remove(0);
+        let route = probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected)
+            .expect("ordinary direct route");
+        assert_eq!(route.execution_policy, None);
+        let mut probe = build_probe(Provider::Anthropic, &selected.model, route.slot);
+        probe.execution_policy = route.execution_policy;
+        run_provider_probe(&target, &probe)
+            .await
+            .expect("direct request has no execution policy");
+    }
+
     #[test]
     fn probe_sends_declared_upstream_model_when_present() {
         let model = ProbeModel {
             canonical: "claude-sonnet-4-6".to_owned(),
             upstream: Some("anthropic.claude-sonnet-4-6-v1".to_owned()),
             fallback: false,
+            binding_revision: None,
         };
         let probe = build_probe(Provider::Anthropic, &model, None);
         assert_eq!(
@@ -1244,6 +1870,7 @@ mod tests {
             canonical: "gpt-5.5".to_owned(),
             upstream: None,
             fallback: false,
+            binding_revision: None,
         };
         let probe = build_probe(Provider::OpenAI, &model, None);
         assert_eq!(probe.body["model"], Value::String("gpt-5.5".to_owned()));
@@ -1256,6 +1883,7 @@ mod tests {
             canonical: fallback_model(&Provider::Zai).to_owned(),
             upstream: None,
             fallback: true,
+            binding_revision: None,
         };
         let probe = build_probe(Provider::Zai, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -1269,6 +1897,7 @@ mod tests {
             canonical: fallback_model(&Provider::Kubetee).to_owned(),
             upstream: None,
             fallback: true,
+            binding_revision: None,
         };
         let probe = build_probe(Provider::Kubetee, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -1732,6 +2361,7 @@ mod tests {
             canonical: fallback_model(&Provider::DeepInfra).to_owned(),
             upstream: None,
             fallback: true,
+            binding_revision: None,
         };
         let probe = build_probe(Provider::DeepInfra, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -1748,6 +2378,7 @@ mod tests {
             canonical: fallback_model(&Provider::Moonmath).to_owned(),
             upstream: None,
             fallback: true,
+            binding_revision: None,
         };
         let probe = build_probe(Provider::Moonmath, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -1838,6 +2469,7 @@ mod tests {
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let providers = providers_for_target(
             &[Provider::DeepInfra, Provider::Engy, Provider::OpenAI],
@@ -1891,17 +2523,20 @@ mod tests {
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let models = vec![
             ProbeModel {
                 canonical: "qwen3.6-35b-a3b".to_owned(),
                 upstream: None,
                 fallback: false,
+                binding_revision: None,
             },
             ProbeModel {
                 canonical: "qwen3.8-27b".to_owned(),
                 upstream: None,
                 fallback: false,
+                binding_revision: None,
             },
         ];
 
@@ -1936,17 +2571,20 @@ mod tests {
                 },
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let models = vec![
             ProbeModel {
                 canonical: "qwen3.6-35b-a3b".to_owned(),
                 upstream: None,
                 fallback: false,
+                binding_revision: None,
             },
             ProbeModel {
                 canonical: "qwen3.8-27b".to_owned(),
                 upstream: None,
                 fallback: false,
+                binding_revision: None,
             },
         ];
 
@@ -1992,11 +2630,13 @@ mod tests {
                 },
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let models = vec![ProbeModel {
             canonical: "qwen3.8-27b".to_owned(),
             upstream: None,
             fallback: false,
+            binding_revision: None,
         }];
 
         assert!(models_for_target(&target, &Provider::Engy, models).is_none());
@@ -2022,6 +2662,7 @@ mod tests {
                 unscoped_coverage(&["claude-sonnet-4-6"]),
             )])),
             worker_backends: HashMap::from([(Provider::Anthropic, "direct".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
 
         let selected = models_for_target(
@@ -2035,35 +2676,103 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_worker_normalizes_legacy_alias_to_mantle_id() {
-        let canonical =
-            HashMap::from([(Provider::Anthropic, vec!["claude-sonnet-4-6".to_owned()])]);
-        let declared = HashMap::from([(
-            (Provider::Anthropic, "claude-sonnet-4-6".to_owned()),
-            DeclaredOffer {
-                upstream_model: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
-                is_offered: true,
-            },
-        )]);
-        let catalog = resolve_probe_models(&[Provider::Anthropic], &canonical, &declared);
+    fn bedrock_worker_probes_a_registry_approved_future_model() {
         let target = StreamingTarget {
             endpoint: "https://worker.example.org".to_owned(),
             node_secret: "secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
-
         let selected = models_for_target(
             &target,
             &Provider::Anthropic,
-            catalog.models_for(&Provider::Anthropic),
+            vec![ProbeModel {
+                canonical: TEST_APPROVED_BEDROCK_MODEL.to_owned(),
+                upstream: Some("anthropic.operator-mapping-must-be-ignored".to_owned()),
+                fallback: false,
+                binding_revision: Some(23),
+            }],
         )
-        .expect("reviewed Bedrock binding");
+        .expect("registry-approved Bedrock binding");
         assert_eq!(selected.len(), 1);
-        assert_eq!(
-            selected[0].model.wire_model(),
-            "anthropic.claude-sonnet-4-6-v1"
+        assert_eq!(selected[0].model.wire_model(), TEST_APPROVED_BEDROCK_MODEL);
+        let probe = build_probe(Provider::Anthropic, &selected[0].model, None);
+        assert_eq!(probe.body["model"], TEST_APPROVED_BEDROCK_MODEL);
+        assert_eq!(probe.model_binding_revision, Some(23));
+    }
+
+    #[test]
+    fn bedrock_response_must_echo_one_exact_selected_binding_revision() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        assert!(!response_confirms_binding_revision(&headers, 23));
+        headers.insert(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("24"),
         );
+        assert!(!response_confirms_binding_revision(&headers, 23));
+        headers.insert(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("23"),
+        );
+        assert!(response_confirms_binding_revision(&headers, 23));
+        headers.append(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("23"),
+        );
+        assert!(!response_confirms_binding_revision(&headers, 23));
+    }
+
+    #[test]
+    fn cli_discovers_future_bedrock_models_and_keeps_the_registry_row_revision() {
+        let binding = BedrockModelBinding {
+            model: TEST_APPROVED_BEDROCK_MODEL.to_owned(),
+            upstream_model: "anthropic.future-system-id-v1".to_owned(),
+            response_model: "future-provider-echo".to_owned(),
+            revision: 29,
+        };
+        let discovered =
+            bedrock_probe_models(&[binding], &[TEST_APPROVED_BEDROCK_MODEL.to_owned()]);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].canonical, TEST_APPROVED_BEDROCK_MODEL);
+        assert_eq!(discovered[0].binding_revision, Some(29));
+        assert_eq!(discovered[0].upstream, None);
+    }
+
+    #[test]
+    fn bedrock_worker_rejects_models_without_registry_binding_revisions() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: None,
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: false,
+        };
+        let rejected = [
+            ProbeModel {
+                canonical: "future-approved-model".to_owned(),
+                upstream: Some("anthropic.operator-selector".to_owned()),
+                fallback: false,
+                binding_revision: None,
+            },
+            ProbeModel {
+                canonical: "unreviewed-model".to_owned(),
+                upstream: Some("unreviewed-model".to_owned()),
+                fallback: false,
+                binding_revision: None,
+            },
+            ProbeModel {
+                canonical: "another-unreviewed-model".to_owned(),
+                upstream: Some("anthropic.other-selector".to_owned()),
+                fallback: false,
+                binding_revision: None,
+            },
+        ];
+        let selected = models_for_target(&target, &Provider::Anthropic, rejected.into())
+            .expect("unverified Bedrock bindings are reported without probing");
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -2079,8 +2788,8 @@ mod tests {
             (
                 Provider::Anthropic,
                 "bedrock",
-                "claude-sonnet-4-6",
-                "anthropic.claude-sonnet-4-6-v2",
+                "unreviewed-bedrock-model",
+                "anthropic.operator-selector",
             ),
         ] {
             let target = StreamingTarget {
@@ -2091,11 +2800,13 @@ mod tests {
                     unscoped_coverage(&[model]),
                 )])),
                 worker_backends: HashMap::from([(provider.clone(), backend.to_owned())]),
+                bedrock_policy_image_capable: false,
             };
             let models = vec![ProbeModel {
                 canonical: model.to_owned(),
                 upstream: Some(upstream.to_owned()),
                 fallback: false,
+                binding_revision: None,
             }];
 
             let selected = models_for_target(&target, &provider, models)
@@ -2114,11 +2825,13 @@ mod tests {
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let fallback = vec![ProbeModel {
             canonical: "glm-5.2".to_owned(),
             upstream: None,
             fallback: true,
+            binding_revision: None,
         }];
 
         let selected =
@@ -2133,6 +2846,7 @@ mod tests {
             node_secret: "secret".to_owned(),
             provider_models: Some(HashMap::new()),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         assert_eq!(
             providers_for_target(&[Provider::Engy], &target),

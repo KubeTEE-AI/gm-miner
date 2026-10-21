@@ -74,7 +74,7 @@ render azure-clouds GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" \
   AZURE_OPENAI_ENDPOINT=https://gm-resource.openai.azure.com/ \
   AZURE_OPENAI_API_KEY=az
 render bedrock GM_NETWORK=testnet GM_NODE_SECRET="${SECRET}" \
-  ANTHROPIC_UPSTREAM=bedrock BEDROCK_REGION=us-west-2 BEDROCK_API_KEY=b
+  ANTHROPIC_UPSTREAM=bedrock BEDROCK_REGION=us-east-1 BEDROCK_API_KEY=b
 
 # The rendered files are 0600 under a 0700 temp dir; ENVOY_UID=0 stops the
 # image entrypoint dropping to the unprivileged envoy user, which could not

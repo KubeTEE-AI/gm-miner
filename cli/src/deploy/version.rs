@@ -4,6 +4,8 @@ use anyhow::{bail, Context, Result};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
+use crate::bedrock_bindings::BEDROCK_MANTLE_IMAGE_FEATURE;
+
 /// A single approved (`compose_hash`, `os_image_hash`) entry from the registry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageVersion {
@@ -45,6 +47,15 @@ impl ImageVersion {
     #[must_use]
     pub fn cloud_binding_capable(&self) -> bool {
         self.features.iter().any(|f| f == "upstream-model-hop")
+    }
+
+    /// The measured image carries the generic dynamic Bedrock model-binding
+    /// adapter and execution-policy handshake.
+    #[must_use]
+    pub fn bedrock_mantle_model_bindings_capable(&self) -> bool {
+        self.features
+            .iter()
+            .any(|feature| feature == BEDROCK_MANTLE_IMAGE_FEATURE)
     }
 }
 
@@ -250,6 +261,19 @@ mod tests {
             image_ref: None,
             features: vec![],
         }
+    }
+
+    #[test]
+    fn bedrock_requires_its_dedicated_image_feature() {
+        let mut version = approved("compose", "os");
+        version.features = vec!["upstream-model-hop".to_owned()];
+        assert!(version.cloud_binding_capable());
+        assert!(!version.bedrock_mantle_model_bindings_capable());
+
+        version
+            .features
+            .push("bedrock-mantle-model-bindings-v1".to_owned());
+        assert!(version.bedrock_mantle_model_bindings_capable());
     }
 
     // ── default image-ref resolution ──────────────────────────────────────────

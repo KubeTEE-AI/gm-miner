@@ -15,9 +15,19 @@ catalog. It distinguishes transport capability from registry admission:
   require registry capability `upstream-model-echo`; `gmcli deploy` also checks
   the approved image for `upstream-model-hop`. Declarations leave per-worker
   eligibility to the registry. Azure Responses is unqualified because its echo
-  is the deployment name; Bedrock inference is disabled inside the image until
-  its transport has an authoritative model echo. A known model id or a
-  successful HTTP probe is not sufficient.
+  is the deployment name. Bedrock Mantle accepts models listed in the fixed
+  network-selected registry binding snapshot in `us-east-1`; it requires the
+  `bedrock-mantle-model-bindings-v1` approved image feature and the selected
+  binding's row revision. The measured adapter validates the raw provider
+  response identity, then canonicalizes the response model before content release.
+  Older images and unadmitted models remain unavailable. A known model id
+  or successful HTTP probe is not sufficient.
+
+Bedrock bindings refresh every 60 seconds and expire 120 seconds after the last
+successful refresh. Failed refreshes do not extend validity. The adapter rechecks
+the current binding after reading the request body and immediately before dispatch.
+Requests already dispatched finish against the binding captured for that request;
+a later mapping change does not replay or retarget them.
 
 Name each Azure OpenAI or Foundry deployment **exactly the canonical gm model id**.
 The image enumerates the bound account's deployments through ARM. Each deployment

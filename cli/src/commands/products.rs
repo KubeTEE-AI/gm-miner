@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use gm_miner_cli::{
     client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
     cloud_policy::{configured_cloud_backend, declaration_policy, CloudDeclarationPolicy},
+    config::Config,
     dependency::confirm,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
@@ -52,6 +53,7 @@ pub(crate) async fn cmd_declare_product(
     discount_bp: u32,
     args: DeclareArgs<'_>,
 ) -> Result<()> {
+    validate_bedrock_offer_selector(&client.config, provider, args.upstream_model)?;
     let policy = declaration_policy(client, provider.as_str()).await;
     if policy.requires_capability {
         let backend = configured_cloud_backend(&client.config, provider.as_str())
@@ -131,6 +133,20 @@ pub(crate) async fn cmd_declare_product(
     .await?;
     println!("  → {}", result.message());
     println!("\nNext: gmcli status   (confirm the offer)");
+    Ok(())
+}
+
+fn validate_bedrock_offer_selector(
+    config: &Config,
+    provider: &Provider,
+    upstream_model: Option<&str>,
+) -> Result<()> {
+    if provider == &Provider::Anthropic
+        && configured_cloud_backend(config, provider.as_str()) == Some("bedrock")
+        && upstream_model.is_some()
+    {
+        bail!("Bedrock Mantle uses the canonical Anthropic model selector; omit --upstream-model");
+    }
     Ok(())
 }
 
@@ -1003,6 +1019,31 @@ mod tests {
 
     fn config_for(server: &MockServer) -> Config {
         config_for_network(server, Network::Testnet)
+    }
+
+    #[test]
+    fn bedrock_declarations_cannot_carry_aws_or_legacy_model_overrides() {
+        let config = Config {
+            provider_keys: Some(ProviderKeys {
+                anthropic_upstream: Some("bedrock".to_owned()),
+                bedrock_region: Some("us-east-1".to_owned()),
+                bedrock_api_key: Some("test-key".to_owned()),
+                ..ProviderKeys::default()
+            }),
+            ..Config::default()
+        };
+        assert!(validate_bedrock_offer_selector(&config, &Provider::Anthropic, None).is_ok());
+        for selector in [
+            "anthropic.claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "anthropic.claude-sonnet-4-6-v1",
+        ] {
+            let error =
+                validate_bedrock_offer_selector(&config, &Provider::Anthropic, Some(selector))
+                    .expect_err("Bedrock offer must use canonical buyer model without override")
+                    .to_string();
+            assert!(error.contains("omit --upstream-model"), "{error}");
+        }
     }
 
     fn config_for_network(server: &MockServer, network: Network) -> Config {

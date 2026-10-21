@@ -372,10 +372,7 @@ fn validate_upstreams_rejects_malformed_bedrock_region() {
         ..ProviderKeys::default()
     };
     let err = keys.validate_upstreams().unwrap_err().to_string();
-    assert!(
-        err.contains("--bedrock-region must contain only letters, numbers, and hyphens"),
-        "{err}"
-    );
+    assert!(err.contains("--bedrock-region must be us-east-1"), "{err}");
 }
 
 #[test]
@@ -435,7 +432,7 @@ fn validate_upstreams_rejects_non_allowed_azure_endpoint() {
 fn validate_upstreams_accepts_complete_cloud_and_direct() {
     let complete = ProviderKeys {
         anthropic_upstream: Some("bedrock".to_owned()),
-        bedrock_region: Some("us-west-2".to_owned()),
+        bedrock_region: Some("us-east-1".to_owned()),
         bedrock_api_key: Some("k".to_owned()),
         openai_upstream: Some("azure".to_owned()),
         azure_openai_endpoint: Some("https://r.openai.azure.com".to_owned()),

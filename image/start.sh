@@ -26,7 +26,10 @@
 #      attests each upstream connection to KubeTEE (nonce-bound TDX quote,
 #      event-log replay, TLS-possession proof) before sending chat
 #      requests on it, and renews it every 10 minutes.
-#   6. envoy — the data plane on :8080. Terminates RA-TLS with the
+#   6. gm-bedrock-mantle-proxy (when ANTHROPIC_UPSTREAM=bedrock) —
+#      accepts registry-bound Anthropic Messages models on 127.0.0.1:8085
+#      and constructs the fixed Mantle request.
+#   7. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
 #      registry's x-gm-provider capability probes, and forwards
 #      /attestation/info to the attestation server.
@@ -204,22 +207,13 @@ case "${ANTHROPIC_UPSTREAM}" in
       exit 1
     fi
     require_single_slot BEDROCK_API_KEY "${BEDROCK_API_KEY}" "ANTHROPIC_UPSTREAM=bedrock"
-    if [[ ! "${BEDROCK_REGION}" =~ ^[A-Za-z0-9-]+$ ]]; then
-      log "error: BEDROCK_REGION must contain only letters, numbers, and hyphens"
+    if [[ "${BEDROCK_REGION}" != "us-east-1" ]]; then
+      log "error: Bedrock Mantle Messages is qualified only in us-east-1"
       exit 1
     fi
-    ANTHROPIC_HOST="bedrock-mantle.$(lowercase "${BEDROCK_REGION}").api.aws"
-    validate_hostname "Bedrock" "${ANTHROPIC_HOST}"
-    case "${ANTHROPIC_HOST}" in
-      bedrock-mantle.*.api.aws) ;;
-      *)
-        log "error: Bedrock host '${ANTHROPIC_HOST}' is not allowed"
-        exit 1
-        ;;
-    esac
-    # anthropic.bedrock.yaml matches this exact Mantle host's SAN; a suffix
-    # match would also admit unrelated *.api.aws certs. Inference is refused
-    # inside the image because Bedrock has no qualified model echo.
+    # Envoy only reaches the loopback adapter. The adapter pins the Mantle
+    # hostname, TLS roots, path and model mapping in measured Rust code.
+    ANTHROPIC_HOST="127.0.0.1"
     ;;
   foundry)
     ## Microsoft Foundry serves Claude on an Anthropic-native passthrough:
@@ -351,12 +345,15 @@ fi
 
 # ── Fan direct provider keys out into per-slot process env ────────────
 validate_node_secret
-if [[ "${AZURE_ENABLED}" -eq 1 && -z "${GM_NODE_SECRET:-}" ]]; then
-  log "error: GM_NODE_SECRET must be set when Azure OpenAI or Foundry cloud slot routing is enabled"
+if [[ ("${AZURE_ENABLED}" -eq 1 || "${ANTHROPIC_UPSTREAM}" == "bedrock") && -z "${GM_NODE_SECRET:-}" ]]; then
+  log "error: GM_NODE_SECRET must be set when cloud key-slot routing is enabled"
   exit 1
 fi
 if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
   fan_out_slots anthropic ANTHROPIC_API_KEY
+fi
+if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" && -n "${BEDROCK_API_KEY:-}" ]]; then
+  fan_out_slots anthropic BEDROCK_API_KEY
 fi
 if [[ "${OPENAI_UPSTREAM}" == "direct" && -n "${OPENAI_API_KEY:-}" ]]; then
   fan_out_slots openai OPENAI_API_KEY
@@ -456,7 +453,7 @@ fi
 log "benchmark route proxies to https://${BENCHMARK_HOST} (GM_NETWORK=${GM_NETWORK})"
 
 if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" ]]; then
-  log "anthropic Bedrock inference is rejected as unqualified (configured host https://${ANTHROPIC_HOST} is retained only for non-inference checks)"
+  log "anthropic Bedrock Mantle adapter uses fixed us-east-1 provider and network-selected model bindings"
 fi
 if [[ "${OPENAI_UPSTREAM}" == "azure" ]]; then
   log "openai route proxies to Azure OpenAI at https://${OPENAI_HOST}"
@@ -494,6 +491,7 @@ log "RA-TLS certificate ready"
 NEAR_PROXY_PID=""
 CHUTES_PROXY_PID=""
 KUBETEE_PROXY_PID=""
+BEDROCK_PROXY_PID=""
 ATTESTD_PID=""
 ENVOY_PID=""
 # shellcheck disable=SC2317,SC2329  # invoked indirectly via the trap below.
@@ -502,7 +500,7 @@ shutdown() {
   local -a pids=()
   local pid
   for pid in "${ENVOY_PID}" "${ATTESTD_PID}" "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}" \
-    "${KUBETEE_PROXY_PID}"; do
+    "${KUBETEE_PROXY_PID}" "${BEDROCK_PROXY_PID}"; do
     if [[ -n "${pid}" ]]; then
       pids+=("${pid}")
     fi
@@ -514,6 +512,22 @@ shutdown() {
   exit 1
 }
 trap shutdown TERM INT
+
+wait_for_loopback_port() {
+  local port="$1"
+  local pid="$2"
+  local attempt
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
 
 # ── Launch the NEAR attestation proxy ─────────────────────────────────
 # NEAR routes exist only when a key is configured. The long-running proxy
@@ -550,6 +564,18 @@ if [[ -n "${KUBETEE_API_KEY:-}" ]]; then
   KUBETEE_PROXY_PID=$!
 fi
 
+# Start the adapter before Envoy can accept Bedrock requests. It fixes the
+# model selector, Mantle hostname, path, TLS roots and configured credential.
+if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" ]]; then
+  log "starting Bedrock Mantle adapter on 127.0.0.1:8085"
+  gm-bedrock-mantle-proxy &
+  BEDROCK_PROXY_PID=$!
+  if ! wait_for_loopback_port 8085 "${BEDROCK_PROXY_PID}"; then
+    log "error: Bedrock Mantle adapter failed to bind 127.0.0.1:8085"
+    exit 1
+  fi
+fi
+
 # ── Launch the attestation server ─────────────────────────────────────
 # gm-miner-attestd binds 127.0.0.1:8081 (envoy's `attestd` cluster
 # target) and fetches TDX quotes over /var/run/dstack.sock. The socket
@@ -568,7 +594,7 @@ if [[ "${AZURE_ENABLED}" -eq 1 ]]; then
     if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
       wait "${ATTESTD_PID}" || true
       log "error: attestation server exited before Azure readiness"
-      for pid in "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}" "${KUBETEE_PROXY_PID}"; do
+      for pid in "${NEAR_PROXY_PID}" "${CHUTES_PROXY_PID}" "${KUBETEE_PROXY_PID}" "${BEDROCK_PROXY_PID}"; do
         if [[ -n "${pid}" ]]; then
           kill -TERM "${pid}" 2>/dev/null || true
         fi
@@ -616,6 +642,9 @@ fi
 if [[ -n "${KUBETEE_PROXY_PID}" ]]; then
   SUPERVISED_PIDS+=("${KUBETEE_PROXY_PID}")
 fi
+if [[ -n "${BEDROCK_PROXY_PID}" ]]; then
+  SUPERVISED_PIDS+=("${BEDROCK_PROXY_PID}")
+fi
 while [[ -z "${FIRST_EXIT_PID}" ]]; do
   RUNNING_PIDS=" $(jobs -pr | tr '\n' ' ') "
   for pid in "${SUPERVISED_PIDS[@]}"; do
@@ -639,6 +668,8 @@ elif [[ -n "${CHUTES_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${CHUTES_PROXY_PID}"
   log "error: Chutes verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ -n "${KUBETEE_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${KUBETEE_PROXY_PID}" ]]; then
   log "error: KubeTEE verification proxy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
+elif [[ -n "${BEDROCK_PROXY_PID}" && "${FIRST_EXIT_PID}" == "${BEDROCK_PROXY_PID}" ]]; then
+  log "error: Bedrock Mantle adapter exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 elif [[ "${FIRST_EXIT_PID}" == "${ENVOY_PID}" ]]; then
   log "error: envoy exited (status ${FIRST_EXIT_STATUS}) — stopping container"
 else

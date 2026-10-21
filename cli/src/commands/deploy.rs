@@ -496,6 +496,58 @@ fn image_is_cloud_binding_capable(
     approved.cloud_binding_capable()
 }
 
+/// Whether the exact image that will run has the generic dynamic Bedrock
+/// binding adapter stamp. Generic cloud model-hop support does not authorize
+/// Bedrock.
+fn image_is_bedrock_mantle_capable(
+    args: &DeployArgs,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+) -> bool {
+    if (args.image_ref.is_none() && args.image_repo.is_some())
+        || approved.status != "supported"
+        || !approved.bedrock_mantle_model_bindings_capable()
+    {
+        return false;
+    }
+    let Some(image_ref) = approved
+        .image_ref
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if args
+        .image_ref
+        .as_deref()
+        .is_some_and(|explicit| explicit != image_ref)
+    {
+        return false;
+    }
+    let compose_hash = normalize_hash(&approved.compose_hash);
+    let os_hash = normalize_hash(&approved.os_image_hash);
+    if ![&compose_hash, &os_hash]
+        .iter()
+        .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    // Capabilities belong to the same measurements checked before deployment.
+    let mut matching = versions
+        .iter()
+        .filter(|version| {
+            normalize_hash(&version.compose_hash) == compose_hash
+                && normalize_hash(&version.os_image_hash) == os_hash
+        })
+        .peekable();
+    matching.peek().is_some()
+        && matching.all(|version| {
+            version.status == "supported"
+                && version.bedrock_mantle_model_bindings_capable()
+                && version.image_ref.as_deref() == Some(image_ref)
+        })
+}
+
 /// Keep every worker registration path behind the registry's authoritative
 /// model-echo admission fence. The image feature is checked separately after
 /// the approved image version is selected; this check protects the registry
@@ -605,6 +657,8 @@ pub(crate) async fn cmd_deploy(
              feature; select an image with cloud model binding or wait for this image to be admitted"
         );
     }
+    let bedrock_policy_image_capable =
+        require_bedrock_policy_image(&worker_backends, args, approved, &versions)?;
     let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
     // Reject incompatible templates/images before creating a billable CVM.
     let expected = gm_miner_cli::deploy::DstackDeployResult {
@@ -664,8 +718,34 @@ pub(crate) async fn cmd_deploy(
     record.provisional_secondary = false;
     persist_worker_record(cfg.active_network(), record.clone())?;
     print_deploy_summary(&record.worker_id, &actual.app_id, registration);
-    deploy_streaming_advisory(cfg, &actual.endpoint, &record.node_secret).await;
+    deploy_streaming_advisory(
+        cfg,
+        &actual.endpoint,
+        &record.node_secret,
+        bedrock_policy_image_capable,
+    )
+    .await;
     Ok(())
+}
+
+fn require_bedrock_policy_image(
+    worker_backends: &std::collections::BTreeMap<String, String>,
+    args: &DeployArgs,
+    approved: &gm_miner_cli::deploy::ImageVersion,
+    versions: &[gm_miner_cli::deploy::ImageVersion],
+) -> Result<bool> {
+    let capable = image_is_bedrock_mantle_capable(args, approved, versions);
+    if worker_backends
+        .get("anthropic")
+        .is_some_and(|backend| backend == "bedrock")
+        && !capable
+    {
+        anyhow::bail!(
+            "Bedrock requires a registry-approved image with the `bedrock-mantle-model-bindings-v1` \
+             feature; old or locally built images cannot serve this route"
+        );
+    }
+    Ok(capable)
 }
 
 async fn deploy_preflight<'a>(
@@ -1325,6 +1405,157 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    fn deploy_args() -> DeployArgs {
+        DeployArgs {
+            app_name: "miner".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("."),
+            image_repo: None,
+            image_tag: "latest".to_owned(),
+            instance_type: "small".to_owned(),
+            disk_size: "30".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: true,
+            accept_terms: true,
+        }
+    }
+
+    #[test]
+    fn bedrock_deploy_capability_uses_the_selected_measurement() {
+        let approved = ImageVersion {
+            git_tag: None,
+            compose_hash: "a".repeat(64),
+            os_image_hash: "b".repeat(64),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2025-01-01T00:00:00Z".to_owned(),
+            image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
+            features: vec!["bedrock-mantle-model-bindings-v0".to_owned()],
+        };
+        let mut args = deploy_args();
+        args.image_ref.clone_from(&approved.image_ref);
+        let current = ImageVersion {
+            features: vec!["bedrock-mantle-model-bindings-v1".to_owned()],
+            ..approved.clone()
+        };
+        let other_os = ImageVersion {
+            os_image_hash: "c".repeat(64),
+            ..current.clone()
+        };
+        assert!(!image_is_bedrock_mantle_capable(
+            &args,
+            &approved,
+            &[approved.clone(), other_os.clone()]
+        ));
+        assert!(require_bedrock_policy_image(
+            &std::collections::BTreeMap::from([("anthropic".to_owned(), "bedrock".to_owned())]),
+            &args,
+            &approved,
+            &[approved.clone(), other_os]
+        )
+        .is_err());
+        assert!(image_is_bedrock_mantle_capable(
+            &args,
+            &current,
+            std::slice::from_ref(&current)
+        ));
+        assert!(!image_is_bedrock_mantle_capable(
+            &args,
+            &current,
+            &[current.clone(), approved.clone()]
+        ));
+        let older_other_os = ImageVersion {
+            os_image_hash: "c".repeat(64),
+            ..approved
+        };
+        assert!(image_is_bedrock_mantle_capable(
+            &args,
+            &current,
+            &[current.clone(), older_other_os]
+        ));
+        for invalid in [
+            ImageVersion {
+                status: "blocked".to_owned(),
+                ..current.clone()
+            },
+            ImageVersion {
+                compose_hash: String::new(),
+                ..current.clone()
+            },
+            ImageVersion {
+                os_image_hash: "invalid".to_owned(),
+                ..current.clone()
+            },
+            ImageVersion {
+                image_ref: Some("registry.example/other".to_owned()),
+                ..current.clone()
+            },
+        ] {
+            assert!(!image_is_bedrock_mantle_capable(
+                &args,
+                &invalid,
+                std::slice::from_ref(&invalid)
+            ));
+        }
+        assert!(!image_is_bedrock_mantle_capable(&args, &current, &[]));
+        args.image_repo = Some("local/image".to_owned());
+        assert!(image_is_bedrock_mantle_capable(
+            &args,
+            &current,
+            std::slice::from_ref(&current)
+        ));
+        args.image_ref = None;
+        assert!(!image_is_bedrock_mantle_capable(
+            &args,
+            &current,
+            std::slice::from_ref(&current)
+        ));
+    }
+
+    #[test]
+    fn bedrock_deploy_uses_a_dedicated_approved_image_capability() {
+        let mut approved = ImageVersion {
+            git_tag: None,
+            compose_hash: "a".repeat(64),
+            os_image_hash: "b".repeat(64),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2025-01-01T00:00:00Z".to_owned(),
+            image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
+            features: vec!["upstream-model-hop".to_owned()],
+        };
+        assert!(!image_is_bedrock_mantle_capable(
+            &deploy_args(),
+            &approved,
+            std::slice::from_ref(&approved)
+        ));
+
+        approved
+            .features
+            .push("bedrock-mantle-model-bindings-v1".to_owned());
+        assert!(image_is_bedrock_mantle_capable(
+            &deploy_args(),
+            &approved,
+            std::slice::from_ref(&approved)
+        ));
+
+        let mut args = deploy_args();
+        args.image_ref = Some("registry.example/miner@sha256:chosen".to_owned());
+        let explicit_old_image = ImageVersion {
+            image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
+            features: vec!["upstream-model-hop".to_owned()],
+            ..approved
+        };
+        assert!(!image_is_bedrock_mantle_capable(
+            &args,
+            &explicit_old_image,
+            std::slice::from_ref(&explicit_old_image)
+        ));
     }
 
     #[tokio::test]

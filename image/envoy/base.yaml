@@ -248,16 +248,27 @@ static_resources:
                             headers:remove("x-envoy-hedge-on-per-try-timeout")
                           end
 
-                          local function strip_internal_headers(headers, provider)
+                          local function strip_internal_headers(headers, provider, bare)
                             -- Envoy forbids header mutation during iteration. Keep the
                             -- route discriminator until route actions remove it,
                             -- NEAR's and KubeTEE's validated selectors until their
-                            -- loopback verifiers, and Chutes' selector and ordinary
-                            -- marker, which choose its route and are removed by it.
+                            -- loopback verifiers, Chutes' selector and ordinary marker,
+                            -- and the execution policy plus model-binding revision only
+                            -- on the exact guarded loopback adapter route. The adapter
+                            -- builds the fixed upstream request itself.
+                            local cfg = slot_config[provider]
+                            local keep_execution_policy = provider == "anthropic"
+                              and cfg ~= nil and cfg.no_retry
+                              and headers:get(":method") == "POST"
+                              and headers:get(":path") == "/v1/messages"
                             local names = {}
                             for name in pairs(headers) do
                               if name:sub(1, 5) == "x-gm-"
                                 and name ~= "x-gm-provider"
+                                and not (keep_execution_policy
+                                  and name == "x-gm-execution-policy")
+                                and not (keep_execution_policy
+                                  and name == "x-gm-model-binding-revision")
                                 and not ((provider == "near" or provider == "chutes"
                                     or provider == "kubetee")
                                   and name == "x-gm-upstream-model")
@@ -304,7 +315,7 @@ static_resources:
                                 handle:respond(
                                   {[":status"] = "400",
                                    ["content-type"] = "application/json"},
-                                  "{\"error\":{\"type\":\"gm_unqualified_surface\",\"message\":\"AWS Bedrock is unqualified inside this image: inference is disabled\"}}")
+                                  "{\"error\":{\"type\":\"gm_unqualified_surface\",\"message\":\"inference is disabled for this upstream\"}}")
                               end
                               return false
                             end
@@ -411,6 +422,12 @@ static_resources:
                           end
 
                           local function non_replayable_request(headers, provider, bare)
+                            if provider == "anthropic" then
+                              local cfg = slot_config[provider]
+                              return cfg ~= nil and cfg.no_retry
+                                and headers:get(":method") == "POST"
+                                and bare == "/v1/messages"
+                            end
                             if provider ~= "deepinfra" and provider ~= "kubetee" and provider ~= "engy" then
                               return false
                             end
@@ -491,7 +508,7 @@ static_resources:
                             if not select_upstream_slot(handle, headers, provider) then
                               return
                             end
-                            strip_internal_headers(headers, provider)
+                            strip_internal_headers(headers, provider, bare)
                           end
                   ## The saturation signal: 429 when the process-wide bucket of 500
                   ## requests/s is empty (JSON body via local_reply_config above). Tunable

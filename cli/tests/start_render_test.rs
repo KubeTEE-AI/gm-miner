@@ -166,12 +166,13 @@ fn run_request(rendered: &str, headers: &[(&str, &str)], env: &[(&str, &str)]) -
     lua
 }
 
-fn execute_cloud_slot_fixture(rendered: &str, provider: &str, request_path: &str, slot_env: &str) {
-    let current_key = if provider == "openai" {
-        "azure-key"
-    } else {
-        "foundry-key"
-    };
+fn execute_cloud_slot_fixture(
+    rendered: &str,
+    provider: &str,
+    request_path: &str,
+    slot_env: &str,
+    current_key: &str,
+) {
     let script = format!(
         "{}\n{}",
         data_plane_lua(rendered),
@@ -289,7 +290,17 @@ fn assert_cloud_route(expected: &CloudRoute<'_>) {
             "envoy.filters.http.router"
         ]
     );
-    execute_cloud_slot_fixture(&rendered, provider, path, env);
+    execute_cloud_slot_fixture(
+        &rendered,
+        provider,
+        path,
+        env,
+        if provider == "openai" {
+            "azure-key"
+        } else {
+            "foundry-key"
+        },
+    );
 }
 
 #[test]
@@ -336,23 +347,131 @@ fn azure_responses_is_rejected_with_the_typed_400() {
 }
 
 #[test]
-fn bedrock_never_forwards_inference_and_authenticates_before_rejection() {
+fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
+    const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+    const EXECUTION_POLICY: &str = "exact-canonical-no-replay-v1";
+    const MODEL_BINDING_REVISION_HEADER: &str = "x-gm-model-binding-revision";
+
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),
-        ("BEDROCK_REGION", "us-west-2"),
+        ("BEDROCK_REGION", "us-east-1"),
         ("BEDROCK_API_KEY", "bedrock-key"),
     ]);
     assert!(status.success(), "render failed: {stderr}");
-    execute_lua(&format!(
-        "{}\n{}",
-        data_plane_lua(&rendered),
-        include_str!("fixtures/bedrock_slot_guard.lua")
-    ));
     let parsed = config(&rendered);
-    assert_eq!(
-        route(&parsed, "anthropic", "/v1/messages")["direct_response"]["status"],
-        400
+    let selected = ingress(&parsed)["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .expect("routes")
+        .iter()
+        .find(|candidate| {
+            candidate["match"]["path"] == "/v1/messages"
+                && candidate["match"]["headers"]
+                    .as_array()
+                    .is_some_and(|headers| {
+                        headers.iter().any(|header| {
+                            header["name"] == ":method" && header["string_match"]["exact"] == "POST"
+                        })
+                    })
+        })
+        .expect("exact Bedrock Messages POST route");
+    assert_eq!(selected["route"]["cluster"], "bedrock_mantle_adapter");
+    assert!(selected["route"]["retry_policy"].is_null());
+    assert!(!selected["request_headers_to_add"]
+        .as_array()
+        .expect("added headers")
+        .iter()
+        .any(|header| header["header"]["key"] == EXECUTION_POLICY_HEADER));
+    assert!(selected["request_headers_to_remove"]
+        .as_array()
+        .expect("removed headers")
+        .contains(&json!("x-envoy-retry-on")));
+    execute_cloud_slot_fixture(
+        &rendered,
+        "anthropic",
+        "/v1/messages",
+        "GM_ANTHROPIC_KEY_SLOT_1",
+        "bedrock-key",
     );
+    let bedrock_slot =
+        gm_miner_cli::slots::derive_slot_id("anthropic", "bedrock-key", "test-node-secret-0001")
+            .expect("Bedrock provider slot");
+    let lua = run_request(
+        &rendered,
+        &[
+            (":method", "POST"),
+            (":path", "/v1/messages"),
+            ("x-gm-provider", "anthropic"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-slot", &bedrock_slot),
+            (EXECUTION_POLICY_HEADER, EXECUTION_POLICY),
+            (MODEL_BINDING_REVISION_HEADER, "17"),
+            ("x-envoy-retry-on", "5xx"),
+        ],
+        &[("GM_ANTHROPIC_KEY_SLOT_1", "bedrock-key")],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<Option<String>>("response_status")
+            .expect("status"),
+        None
+    );
+    let forwarded_headers = lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("forwarded headers");
+    assert_eq!(
+        forwarded_headers
+            .get::<Option<String>>(EXECUTION_POLICY_HEADER)
+            .expect("execution policy"),
+        Some(EXECUTION_POLICY.to_owned())
+    );
+    assert_eq!(
+        forwarded_headers
+            .get::<Option<String>>(MODEL_BINDING_REVISION_HEADER)
+            .expect("model-binding revision"),
+        Some("17".to_owned())
+    );
+    assert!(forwarded_headers
+        .get::<Option<String>>("x-envoy-retry-on")
+        .expect("retry header")
+        .is_none());
+}
+
+#[test]
+fn direct_anthropic_route_strips_the_generic_execution_policy() {
+    const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+    const EXECUTION_POLICY: &str = "exact-canonical-no-replay-v1";
+    const MODEL_BINDING_REVISION_HEADER: &str = "x-gm-model-binding-revision";
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "direct-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let direct_slot =
+        gm_miner_cli::slots::derive_slot_id("anthropic", "direct-key", "test-node-secret-0001")
+            .expect("direct Anthropic slot");
+    let direct_lua = run_request(
+        &rendered,
+        &[
+            (":method", "POST"),
+            (":path", "/v1/messages"),
+            ("x-gm-provider", "anthropic"),
+            ("x-gm-node-key", "test-node-secret-0001"),
+            ("x-gm-upstream-slot", &direct_slot),
+            (EXECUTION_POLICY_HEADER, EXECUTION_POLICY),
+            (MODEL_BINDING_REVISION_HEADER, "17"),
+        ],
+        &[("GM_ANTHROPIC_KEY_SLOT_1", "direct-key")],
+    );
+    let direct_headers = direct_lua
+        .globals()
+        .get::<mlua::Table>("input_headers")
+        .expect("direct headers");
+    assert!(direct_headers
+        .get::<Option<String>>(EXECUTION_POLICY_HEADER)
+        .expect("stripped direct execution policy")
+        .is_none());
+    assert!(direct_headers
+        .get::<Option<String>>(MODEL_BINDING_REVISION_HEADER)
+        .expect("stripped direct model-binding revision")
+        .is_none());
 }
 
 #[test]
@@ -1097,7 +1216,7 @@ fn azure_host_allowlist_rejects_bad_suffix() {
 }
 
 #[test]
-fn bedrock_region_validation_rejects_bad_host_input() {
+fn bedrock_region_validation_rejects_unqualified_region() {
     let (status, _, stderr, _) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),
         ("BEDROCK_REGION", "us-west-2.evil.example"),
@@ -1105,7 +1224,7 @@ fn bedrock_region_validation_rejects_bad_host_input() {
     ]);
     assert!(!status.success(), "bad Bedrock region should fail");
     assert!(
-        stderr.contains("BEDROCK_REGION must contain only letters, numbers, and hyphens"),
+        stderr.contains("Bedrock Mantle Messages is qualified only in us-east-1"),
         "unexpected stderr: {stderr}"
     );
 }

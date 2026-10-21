@@ -305,7 +305,7 @@ fn unqualified_checks(keys: Option<&ProviderKeys>) -> Vec<Check> {
     if keys.anthropic_upstream.as_deref() == Some("bedrock") {
         checks.push(Check::info(
             "Bedrock inference",
-            "skipped: surface is unqualified; no authoritative model echo has been admitted",
+            "skipped: doctor does not send model requests; registry admission verifies the raw Mantle model identity",
         ));
     }
     checks
@@ -945,7 +945,8 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, Status::Info);
         assert!(checks[0].note.contains("skipped"));
-        assert!(checks[0].note.contains("unqualified"));
+        assert!(checks[0].note.contains("does not send model requests"));
+        assert!(checks[0].note.contains("raw Mantle model identity"));
     }
 
     #[test]

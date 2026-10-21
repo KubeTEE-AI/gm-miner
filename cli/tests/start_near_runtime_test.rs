@@ -56,6 +56,16 @@ exec sleep 30
     executable(
         &bin.join("envoy"),
         r#"#!/usr/bin/env bash
+# The entrypoint starts these child processes before Envoy but deliberately
+# does not wait for the optional NEAR proxy's socket to become ready. Let both
+# mock children run before this test Envoy exits, so the assertions below do
+# not depend on the host scheduler's child-process timing.
+for _ in $(seq 1 100); do
+  if [[ -e "${GM_TEST_MARKERS}/near-runtime" && -e "${GM_TEST_MARKERS}/attestd" ]]; then
+    break
+  fi
+  sleep 0.01
+done
 touch "${GM_TEST_MARKERS}/envoy"
 if [[ -n "${GM_TEST_ENVOY_EXIT:-}" ]]; then
   exit "${GM_TEST_ENVOY_EXIT}"
