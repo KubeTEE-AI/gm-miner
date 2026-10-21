@@ -5,7 +5,9 @@ source: an HTTP-successful Foundry probe is transport capability, not
 authoritative model admission. Cloud registration, recovery, and declaration
 also require a registry that advertises `upstream-model-echo`; the deployed
 image must advertise `upstream-model-hop`. Azure OpenAI chat completions uses
-the same gates, while Azure Responses and Bedrock remain unqualified.
+the same gates, while Azure Responses remains unqualified. The separate Bedrock
+Mantle candidate is limited to Opus 4.8 in `us-east-1` and requires its dedicated
+approved image feature plus registry admission of the raw response model echo.
 
 The rest of this guide prepares the Azure resource, endpoint, credentials, and
 canonical deployment names. It covers the Azure side — the resource, the connections and

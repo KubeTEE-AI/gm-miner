@@ -52,7 +52,8 @@ slots:                        # omit for an upstream without keys (benchmark)
   auth_header: authorization  # header Lua sets from the selected key
   auth_prefix: "Bearer "      # prepended to the key; default ""
   cloud: false                # true: a route adds the key, Lua only checks the slot
-  disabled: false             # true: every request is refused (Bedrock)
+  disabled: false             # true: every request is refused
+  no_retry: false             # true: disable retries on the configured exact path/method
 routes: [ ... ]               # Envoy route objects, in match order
 clusters: [ ... ]             # Envoy cluster objects
 ```
@@ -86,6 +87,10 @@ These apply to every provider route unless its file says otherwise.
   - There is no `per_try_timeout`, because it would cut long generations.
   - A body larger than the connection buffer cannot be replayed, so Envoy
     skips that retry.
+- **No retry** on Bedrock Mantle's exact `POST /v1/messages` path; inference
+  requests can be billable even when no response reaches the buyer. The route
+  also strips caller-supplied retry headers, and the adapter disables its HTTP
+  transport retry policy.
 - **No retry** on non-idempotent paths (DeepInfra `/v1/inference/`, KubeTEE
   image generation, Engy `/v2/video_generation`, and both suppliers' `/v1/videos`
   and `/v1/videos/` routes),

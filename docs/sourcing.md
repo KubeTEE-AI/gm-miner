@@ -123,14 +123,16 @@ and output dimensions.
 
 The image retains three cloud transports. Azure OpenAI chat completions and
 Foundry Messages forward request bodies unchanged through Envoy. Azure Responses is
-explicitly rejected because its echo is the deployment name. Bedrock inference is
-disabled: requests return 421 with a slot header and 400 without one. Selecting one per worker does
+explicitly rejected because its echo is the deployment name. The Bedrock Mantle
+candidate is limited to canonical `claude-opus-4-8` in `us-east-1` and requires
+the dedicated approved image feature plus registry admission of its raw model
+echo. Older images and unadmitted candidates remain unavailable. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/*` | AWS Bedrock | `--anthropic-upstream bedrock` — inference disabled; 421 with a slot header, 400 without one |
+| `anthropic/claude-opus-4-8` | AWS Bedrock Mantle | `--anthropic-upstream bedrock` — `us-east-1` only; requires approved `bedrock-mantle-opus48-v1` image and raw `claude-opus-4-8` registry admission |
 | `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
 | `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` — qualified measured transport; `/v1/responses` is rejected |
 

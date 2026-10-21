@@ -12,14 +12,16 @@ behind the existing Anthropic/OpenAI routes) and your own funded
 [Phala Cloud](https://cloud.phala.network) account. Transport capability is not registry
 admission: Azure OpenAI chat completions and Foundry Messages are qualified only when the
 image's `upstream-model-hop` feature and the registry's `upstream-model-echo` capability are
-both present. Azure Responses is unqualified because its echo is the deployment name, and
-Bedrock inference is disabled: requests return 421 with a slot header and 400 without one. Direct
+both present. Azure Responses is unqualified because its echo is the deployment name. The
+Bedrock Mantle candidate is limited to `claude-opus-4-8` in `us-east-1`; it requires the
+dedicated approved image feature `bedrock-mantle-opus48-v1` and registry admission of its raw
+model echo. Older images and unadmitted candidates remain unavailable. Direct
 Anthropic/OpenAI routes use verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
 | Path | Description |
 |---|---|
-| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat requests pass through an in-image verifier which attests each upstream TLS connection before forwarding on it. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, the optional NEAR, Chutes and KubeTEE verifiers, and the Envoy data plane. |
+| `image/` | Miner container image with eleven provider routes (Anthropic / OpenAI / Gemini / Chutes / Z.ai / Moonshot / DeepInfra / KubeTEE / Engy / Moonmath / NEAR) and an optional `benchmark` route to a synthetic upstream. Anthropic can target direct Anthropic, AWS Bedrock, or Microsoft Foundry; OpenAI can target direct OpenAI or Azure OpenAI. NEAR requests pass through an in-image verifier which attests the exact upstream TLS connection before forwarding. Chutes `-TEE` requests pass through an in-image verifier which admits the Chutes instance on verified TDX, GPU and measurement evidence and encrypts each request end to end to its attested key. KubeTEE chat requests pass through an in-image verifier which attests each upstream TLS connection before forwarding on it. Pinned to digest. At startup the entrypoint mints the data-plane RA-TLS certificate (one-shot), then runs the attestation server, optional NEAR, Chutes, KubeTEE and Bedrock Mantle adapters, and the Envoy data plane. |
 | `cli/` | `gmcli` CLI (Rust + clap). Operator commands handle login, image registration, products, and prices. The image also uses its hidden `slot-env` command to derive upstream key slots inside the TEE. |
 | `dstack/` | Docker Compose template for the miner workload; `gmcli deploy` renders it and submits it to Phala Cloud. |
 | `docs/` | Operator-facing docs including reproducibility caveats. |
@@ -197,7 +199,8 @@ Cloud registration, recovery and declaration require registry capability
 `upstream-model-echo`; deployment also requires the approved image feature
 `upstream-model-hop`. These contract names are unchanged. The gateway checks each response's
 model echo. Azure Responses still returns a typed JSON 400 because its echo identifies the
-deployment name. Bedrock inference remains disabled: 421 with a slot header, typed 400 without.
+deployment name. The Bedrock Mantle candidate is limited to Opus 4.8 in `us-east-1` and needs
+its dedicated approved image feature plus registry admission of the raw response model echo.
 Azure OpenAI and Foundry each accept exactly one HMAC slot derived from their single cloud key;
 all other slot ids return 421. Cloud keys cannot contain semicolons.
 
@@ -323,8 +326,9 @@ increase. Older registries continue to accept declarations immediately.
 
 Use the registry-owned source model for every admitted route; do not override it with a deployment
 name. After the capability check, a cloud offer is declared exactly like its direct
-counterpart; the registry decides whether each worker is eligible. Azure Responses and Bedrock remain unqualified; legacy Bedrock ids remain
-representable for audit and transport diagnostics.
+counterpart; the registry decides whether each worker is eligible. Azure Responses remains
+unqualified. Bedrock offers are limited to the feature-gated Opus 4.8 route above; old AWS
+selector values are not sent by the CLI.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt

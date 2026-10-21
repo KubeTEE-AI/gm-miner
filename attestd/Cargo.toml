@@ -49,6 +49,10 @@ path = "src/bin/chutes_verify_proxy.rs"
 name = "gm-kubetee-verify-proxy"
 path = "src/bin/kubetee_verify_proxy.rs"
 
+[[bin]]
+name = "gm-bedrock-mantle-proxy"
+path = "src/bin/bedrock_mantle_proxy.rs"
+
 [lib]
 name = "gm_miner_attestd"
 path = "src/lib.rs"

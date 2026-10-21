@@ -46,6 +46,16 @@ impl ImageVersion {
     pub fn cloud_binding_capable(&self) -> bool {
         self.features.iter().any(|f| f == "upstream-model-hop")
     }
+
+    /// Only the image that contains the fixed Opus 4.8 Mantle adapter carries
+    /// this reviewed capability stamp. A generic cloud-hop stamp is not enough
+    /// to route Bedrock requests through the adapter.
+    #[must_use]
+    pub fn bedrock_mantle_opus48_capable(&self) -> bool {
+        self.features
+            .iter()
+            .any(|f| f == "bedrock-mantle-opus48-v1")
+    }
 }
 
 /// Response body from `GET /image-versions?status=supported`.
@@ -250,6 +260,17 @@ mod tests {
             image_ref: None,
             features: vec![],
         }
+    }
+
+    #[test]
+    fn bedrock_requires_its_dedicated_image_feature() {
+        let mut version = approved("compose", "os");
+        version.features = vec!["upstream-model-hop".to_owned()];
+        assert!(version.cloud_binding_capable());
+        assert!(!version.bedrock_mantle_opus48_capable());
+
+        version.features.push("bedrock-mantle-opus48-v1".to_owned());
+        assert!(version.bedrock_mantle_opus48_capable());
     }
 
     // ── default image-ref resolution ──────────────────────────────────────────

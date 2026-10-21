@@ -116,8 +116,8 @@ fn add_provider_slots(
 ///
 /// A selected qualified cloud upstream contributes exactly one slot for its
 /// provider; the cloud key is single-slot while direct providers retain their
-/// existing semicolon-separated behavior. Unqualified Bedrock contributes no
-/// slot because the image deliberately rejects every Bedrock slot header.
+/// existing semicolon-separated behavior. Bedrock's canonical Opus 4.8 route
+/// uses the Anthropic provider namespace and requires the measured adapter.
 ///
 /// # Errors
 /// Returns an error when a cloud-backend key contains `;`, or when any direct
@@ -143,6 +143,14 @@ pub fn provider_slots_for_keys(
             &mut slots,
             "anthropic",
             keys.azure_foundry_api_key.as_deref(),
+            node_secret,
+        )?;
+    }
+    if keys.anthropic_upstream.as_deref() == Some("bedrock") {
+        add_provider_slots(
+            &mut slots,
+            "anthropic",
+            keys.bedrock_api_key.as_deref(),
             node_secret,
         )?;
     }
@@ -302,14 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_bedrock_does_not_advertise_a_rejected_slot() {
+    fn qualified_bedrock_advertises_its_single_anthropic_slot() {
         let keys = ProviderKeys {
             anthropic_upstream: Some("bedrock".to_owned()),
             bedrock_api_key: Some("bedrock-key".to_owned()),
             ..ProviderKeys::default()
         };
-        let slots = provider_slots_for_keys(&keys, SECRET).expect("direct Bedrock route");
-        assert!(!slots.contains_key("anthropic"));
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("Bedrock slot");
+        let expected = derive_slot_id("anthropic", "bedrock-key", SECRET).expect("slot id");
+        assert_eq!(slots["anthropic"], [expected]);
     }
 
     #[test]

@@ -77,9 +77,10 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 8] = [
+pub const IMAGE_FEATURES: [&str; 9] = [
     "upstream-key-slots",
     "upstream-model-hop",
+    "bedrock-mantle-opus48-v1",
     "deepinfra-native-images",
     "chutes-verified-chat",
     "kubetee-attested-chat",
@@ -444,6 +445,7 @@ mod tests {
             serde_json::json!([
                 "upstream-key-slots",
                 "upstream-model-hop",
+                "bedrock-mantle-opus48-v1",
                 "deepinfra-native-images",
                 "chutes-verified-chat",
                 "kubetee-attested-chat",

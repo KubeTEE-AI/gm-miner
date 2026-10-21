@@ -417,13 +417,10 @@ const AZURE_OPENAI_ALLOWED_SUFFIXES: [&str; 3] = [
 ];
 
 fn validate_bedrock_region(region: &str) -> Result<()> {
-    if region
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
+    if region == "us-east-1" {
         Ok(())
     } else {
-        anyhow::bail!("--bedrock-region must contain only letters, numbers, and hyphens")
+        anyhow::bail!("--bedrock-region must be us-east-1 for qualified Bedrock Mantle Opus 4.8")
     }
 }
 
@@ -1193,6 +1190,27 @@ mod tests {
             .expect_err("multi-slot Foundry key must be rejected")
             .to_string();
         assert!(err.contains("single-slot"), "{err}");
+    }
+
+    #[test]
+    fn bedrock_requires_the_qualified_mantle_region() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_region: Some("us-east-1".to_owned()),
+            bedrock_api_key: Some("test-key".to_owned()),
+            ..ProviderKeys::default()
+        };
+        assert!(keys.validate_upstreams().is_ok());
+
+        let unsupported = ProviderKeys {
+            bedrock_region: Some("us-west-2".to_owned()),
+            ..keys
+        };
+        let error = unsupported
+            .validate_upstreams()
+            .expect_err("Mantle qualification is region-bound")
+            .to_string();
+        assert!(error.contains("us-east-1"), "{error}");
     }
 
     #[test]

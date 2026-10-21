@@ -1,64 +1,46 @@
 slots:
-  direct_env: ANTHROPIC_API_KEY
+  direct_env: BEDROCK_API_KEY
   cloud: true
-  disabled: true
+  no_retry: true
 
 routes:
-  ##  Bedrock has no authoritative model echo in this
-  ##  image. Reject every inference request before the
-  ##  direct Bedrock cluster can be selected.
   - match:
-      prefix: "/"
+      path: "/v1/messages"
       headers:
+        - name: ":method"
+          string_match:
+            exact: "POST"
         - name: "x-gm-provider"
           string_match:
             exact: "anthropic"
-    direct_response:
-      status: 400
-      body:
-        inline_string: '{"error":{"type":"gm_unqualified_surface","message":"AWS Bedrock is unqualified inside this image: inference is disabled"}}'
-    response_headers_to_add:
-      - header:
-          key: content-type
-          value: application/json
-        append_action: OVERWRITE_IF_EXISTS_OR_ADD
+    route:
+      cluster: bedrock_mantle_adapter
+      timeout: 1800s
     request_headers_to_remove:
       - authorization
       - api-key
       - x-api-key
+      - x-goog-api-key
+      - x-envoy-retry-on
+      - x-envoy-retry-grpc-on
+      - x-envoy-max-retries
+      - x-envoy-hedge-on-per-try-timeout
+    request_headers_to_add:
+      - header:
+          key: anthropic-version
+          value: "2023-06-01"
+        append_action: OVERWRITE_IF_EXISTS_OR_ADD
+
 clusters:
-  - name: anthropic
-    type: LOGICAL_DNS
-    connect_timeout: 10s
-    dns_lookup_family: V4_ONLY
-    typed_extension_protocol_options:
-      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
-        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-        explicit_http_config:
-          http2_protocol_options:
-            max_concurrent_streams: 32
-            connection_keepalive:
-              interval: 30s
-              timeout: 10s
+  - name: bedrock_mantle_adapter
+    type: STATIC
+    connect_timeout: 5s
     load_assignment:
-      cluster_name: anthropic
+      cluster_name: bedrock_mantle_adapter
       endpoints:
         - lb_endpoints:
             - endpoint:
                 address:
                   socket_address:
-                    address: __GM_ANTHROPIC_HOST__
-                    port_value: 443
-    transport_socket:
-      name: envoy.transport_sockets.tls
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-        sni: __GM_ANTHROPIC_HOST__
-        common_tls_context:
-          validation_context:
-            trusted_ca:
-              filename: /etc/ssl/certs/ca-certificates.crt
-            match_typed_subject_alt_names:
-              - san_type: DNS
-                matcher:
-                  exact: __GM_ANTHROPIC_HOST__
+                    address: 127.0.0.1
+                    port_value: 8085

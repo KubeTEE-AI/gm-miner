@@ -496,6 +496,25 @@ fn image_is_cloud_binding_capable(
     approved.cloud_binding_capable()
 }
 
+/// Whether the exact image that will run has the dedicated Opus 4.8 Mantle
+/// adapter stamp. Generic cloud model-hop support does not authorize Bedrock.
+fn image_is_bedrock_mantle_opus48_capable(
+    args: &DeployArgs,
+    approved: &ImageVersion,
+    versions: &[ImageVersion],
+) -> bool {
+    if let Some(explicit) = args.image_ref.as_deref() {
+        return versions.iter().any(|version| {
+            version.image_ref.as_deref() == Some(explicit)
+                && version.bedrock_mantle_opus48_capable()
+        });
+    }
+    if args.image_repo.is_some() {
+        return false;
+    }
+    approved.bedrock_mantle_opus48_capable()
+}
+
 /// Keep every worker registration path behind the registry's authoritative
 /// model-echo admission fence. The image feature is checked separately after
 /// the approved image version is selected; this check protects the registry
@@ -603,6 +622,16 @@ pub(crate) async fn cmd_deploy(
         anyhow::bail!(
             "cloud upstreams require a registry-approved image with the `upstream-model-hop` \
              feature; select an image with cloud model binding or wait for this image to be admitted"
+        );
+    }
+    if worker_backends
+        .get("anthropic")
+        .is_some_and(|backend| backend == "bedrock")
+        && !image_is_bedrock_mantle_opus48_capable(args, approved, &versions)
+    {
+        anyhow::bail!(
+            "Bedrock requires a registry-approved image with the `bedrock-mantle-opus48-v1` \
+             feature; old or locally built images cannot serve this route"
         );
     }
     let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
@@ -1325,6 +1354,65 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    fn deploy_args() -> DeployArgs {
+        DeployArgs {
+            app_name: "miner".to_owned(),
+            image_ref: None,
+            project_dir: std::path::PathBuf::from("."),
+            image_repo: None,
+            image_tag: "latest".to_owned(),
+            instance_type: "small".to_owned(),
+            disk_size: "30".to_owned(),
+            repo_root: None,
+            version: None,
+            boot_timeout_secs: 300,
+            phala_api_key: None,
+            assume_yes: true,
+            accept_terms: true,
+        }
+    }
+
+    #[test]
+    fn bedrock_deploy_uses_a_dedicated_approved_image_capability() {
+        let mut approved = ImageVersion {
+            git_tag: None,
+            compose_hash: "compose".to_owned(),
+            os_image_hash: "os".to_owned(),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2025-01-01T00:00:00Z".to_owned(),
+            image_ref: None,
+            features: vec!["upstream-model-hop".to_owned()],
+        };
+        assert!(!image_is_bedrock_mantle_opus48_capable(
+            &deploy_args(),
+            &approved,
+            &[]
+        ));
+
+        approved
+            .features
+            .push("bedrock-mantle-opus48-v1".to_owned());
+        assert!(image_is_bedrock_mantle_opus48_capable(
+            &deploy_args(),
+            &approved,
+            &[]
+        ));
+
+        let mut args = deploy_args();
+        args.image_ref = Some("registry.example/miner@sha256:chosen".to_owned());
+        let explicit_old_image = ImageVersion {
+            image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
+            features: vec!["upstream-model-hop".to_owned()],
+            ..approved
+        };
+        assert!(!image_is_bedrock_mantle_opus48_capable(
+            &args,
+            &explicit_old_image,
+            std::slice::from_ref(&explicit_old_image)
+        ));
     }
 
     #[tokio::test]

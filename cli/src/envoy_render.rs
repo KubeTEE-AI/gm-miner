@@ -55,6 +55,8 @@ struct Slots {
     cloud: bool,
     #[serde(default)]
     disabled: bool,
+    #[serde(default)]
+    no_retry: bool,
     auth_header: Option<String>,
     #[serde(default)]
     auth_prefix: String,
@@ -349,11 +351,12 @@ fn slot_config_lua(upstreams: &[Upstream], env: &dyn Fn(&str) -> Option<String>)
             .map_or("nil".to_owned(), lua_string);
         let _ = write!(
             out,
-            "[{}] = {{cloud = {}, disabled = {}, direct_env = {}, default_env = {default_env}, \
+            "[{}] = {{cloud = {}, disabled = {}, no_retry = {}, direct_env = {}, default_env = {default_env}, \
              slots = {slot_map}, auth_header = {auth_header}, auth_prefix = {}}}, ",
             lua_string(&upstream.provider),
             slots.cloud,
             slots.disabled,
+            slots.no_retry,
             lua_string(&slots.direct_env),
             lua_string(&slots.auth_prefix),
         );
@@ -456,11 +459,14 @@ clusters:
     fn lua_config(rendered: &str) -> (mlua::Lua, mlua::Table) {
         let lua = mlua::Lua::new();
         let source = parsed(rendered)["lua"].as_str().expect("lua").to_owned();
-        let config = lua
-            .load(format!("{source}\nreturn slot_config"))
-            .eval()
-            .expect("rendered Lua runs");
+        let config = lua_slot_config(&lua, &source);
         (lua, config)
+    }
+
+    fn lua_slot_config(lua: &mlua::Lua, source: &str) -> mlua::Table {
+        lua.load(format!("{source}\nreturn slot_config"))
+            .eval()
+            .expect("rendered Lua runs")
     }
 
     #[test]
@@ -588,6 +594,7 @@ clusters:
             "Bearer "
         );
         assert!(!acme.get::<bool>("cloud").expect("cloud"));
+        assert!(!acme.get::<bool>("no_retry").expect("no_retry"));
     }
 
     #[test]
@@ -603,6 +610,63 @@ clusters:
             acme.get::<mlua::Table>("slots").expect("slots").raw_len(),
             0
         );
+    }
+
+    #[test]
+    fn bedrock_mantle_route_is_exact_loopback_and_single_attempt() {
+        const BEDROCK_BASE: &str = include_str!("../../image/envoy/base.yaml");
+        const BEDROCK: &str = include_str!("../../image/envoy/upstreams/anthropic.bedrock.yaml");
+        let fixture = Fixture::new(BEDROCK_BASE, &[("anthropic.bedrock.yaml", BEDROCK)]);
+        let out = parsed(
+            &fixture
+                .render(&[("anthropic", "bedrock")], VARS)
+                .expect("render Bedrock route"),
+        );
+
+        let route = out
+            .pointer(
+                "/static_resources/listeners/0/filter_chains/0/filters/0/typed_config/route_config/virtual_hosts/0/routes",
+            )
+            .and_then(serde_json::Value::as_array)
+            .expect("routes")
+            .iter()
+            .find(|route| route["match"]["path"] == "/v1/messages")
+            .expect("Bedrock route");
+        assert_eq!(route["match"]["path"], "/v1/messages");
+        assert!(route["retry_policy"].is_null());
+        assert!(route["request_headers_to_remove"]
+            .as_array()
+            .expect("removed headers")
+            .iter()
+            .any(|header| header == "x-envoy-retry-on"));
+        let cluster = out
+            .pointer("/static_resources/clusters")
+            .and_then(serde_json::Value::as_array)
+            .expect("clusters")
+            .iter()
+            .find(|cluster| cluster["name"] == "bedrock_mantle_adapter")
+            .expect("loopback adapter cluster");
+        assert_eq!(
+            cluster["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]["address"]
+                ["socket_address"]["address"],
+            "127.0.0.1"
+        );
+        assert_eq!(
+            cluster["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]["address"]
+                ["socket_address"]["port_value"],
+            8085
+        );
+
+        let source = out
+            .pointer(
+                "/static_resources/listeners/0/filter_chains/0/filters/0/typed_config/http_filters/0/typed_config/default_source_code/inline_string",
+            )
+            .and_then(serde_json::Value::as_str)
+            .expect("Lua source");
+        let lua = mlua::Lua::new();
+        let config = lua_slot_config(&lua, source);
+        let anthropic: mlua::Table = config.get("anthropic").expect("Anthropic slot config");
+        assert!(anthropic.get::<bool>("no_retry").expect("no_retry"));
     }
 
     #[test]

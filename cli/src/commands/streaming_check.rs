@@ -11,7 +11,9 @@ use gm_miner_cli::{
         build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH,
         VIDEO_JOBS_HEADER,
     },
-    cloud_policy::normalize_bedrock_upstream_model,
+    cloud_policy::{
+        is_reviewed_bedrock_binding, REVIEWED_BEDROCK_MODEL, REVIEWED_BEDROCK_PROVIDER,
+    },
     config::{Config, ProviderKeys, WorkerRecord},
     types::{
         MinerStatus, Product, ProductCatalogResponse, Provider, SourceProduct, WorkerEntry,
@@ -495,9 +497,10 @@ fn models_for_target(
 ///
 /// Offers are miner-scoped, so their `upstream_model` cannot be used blindly:
 /// a direct worker must send the canonical id even when a sibling Bedrock
-/// worker's offer carries a deployment id. Bedrock accepts only the reviewed
-/// canonical/legacy ids; Azure, Foundry, and unknown cloud backends stay
-/// unverified until an authoritative binding exists.
+/// worker's offer carries a deployment id. Bedrock accepts only the canonical
+/// Opus 4.8 buyer model; the adapter owns the AWS selector rewrite. Azure,
+/// Foundry, and unknown cloud backends stay unverified until an authoritative
+/// binding exists.
 fn bind_models_to_worker(
     target: &StreamingTarget,
     provider: &Provider,
@@ -514,13 +517,16 @@ fn bind_models_to_worker(
         Some("bedrock") => models
             .into_iter()
             .filter_map(|mut model| {
-                let upstream = model.upstream.as_deref()?;
-                let normalized = normalize_bedrock_upstream_model(
-                    provider.as_str(),
-                    &model.canonical,
-                    upstream,
-                )?;
-                model.upstream = Some(normalized.to_owned());
+                if model.canonical != REVIEWED_BEDROCK_MODEL
+                    || model.upstream.as_deref().is_some_and(|upstream| {
+                        !is_reviewed_bedrock_binding(provider.as_str(), &model.canonical, upstream)
+                    })
+                    || provider.as_str() != REVIEWED_BEDROCK_PROVIDER
+                {
+                    return None;
+                }
+                // The buyer and probe both use the canonical ingress selector.
+                model.upstream = None;
                 Some(model)
             })
             .collect(),
@@ -2035,35 +2041,57 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_worker_normalizes_legacy_alias_to_mantle_id() {
-        let canonical =
-            HashMap::from([(Provider::Anthropic, vec!["claude-sonnet-4-6".to_owned()])]);
-        let declared = HashMap::from([(
-            (Provider::Anthropic, "claude-sonnet-4-6".to_owned()),
-            DeclaredOffer {
-                upstream_model: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
-                is_offered: true,
-            },
-        )]);
-        let catalog = resolve_probe_models(&[Provider::Anthropic], &canonical, &declared);
+    fn bedrock_worker_probes_only_the_canonical_opus_ingress_model() {
         let target = StreamingTarget {
             endpoint: "https://worker.example.org".to_owned(),
             node_secret: "secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
         };
-
         let selected = models_for_target(
             &target,
             &Provider::Anthropic,
-            catalog.models_for(&Provider::Anthropic),
+            vec![ProbeModel {
+                canonical: "claude-opus-4-8".to_owned(),
+                upstream: Some("claude-opus-4-8".to_owned()),
+                fallback: false,
+            }],
         )
-        .expect("reviewed Bedrock binding");
+        .expect("canonical Bedrock binding");
         assert_eq!(selected.len(), 1);
-        assert_eq!(
-            selected[0].model.wire_model(),
-            "anthropic.claude-sonnet-4-6-v1"
-        );
+        assert_eq!(selected[0].model.wire_model(), "claude-opus-4-8");
+        let probe = build_probe(Provider::Anthropic, &selected[0].model, None);
+        assert_eq!(probe.body["model"], "claude-opus-4-8");
+    }
+
+    #[test]
+    fn bedrock_worker_rejects_aws_selectors_and_old_sonnet_aliases() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: None,
+            worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+        };
+        let rejected = [
+            ProbeModel {
+                canonical: "claude-opus-4-8".to_owned(),
+                upstream: Some("anthropic.claude-opus-4-8".to_owned()),
+                fallback: false,
+            },
+            ProbeModel {
+                canonical: "claude-sonnet-4-6".to_owned(),
+                upstream: Some("claude-sonnet-4-6".to_owned()),
+                fallback: false,
+            },
+            ProbeModel {
+                canonical: "claude-sonnet-4-6".to_owned(),
+                upstream: Some("anthropic.claude-sonnet-4-6-v1".to_owned()),
+                fallback: false,
+            },
+        ];
+        let selected = models_for_target(&target, &Provider::Anthropic, rejected.into())
+            .expect("unverified Bedrock bindings are reported without probing");
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -2079,8 +2107,8 @@ mod tests {
             (
                 Provider::Anthropic,
                 "bedrock",
-                "claude-sonnet-4-6",
-                "anthropic.claude-sonnet-4-6-v2",
+                "claude-opus-4-8",
+                "anthropic.claude-opus-4-8",
             ),
         ] {
             let target = StreamingTarget {
