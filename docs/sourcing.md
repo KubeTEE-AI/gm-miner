@@ -125,14 +125,17 @@ The image retains three cloud transports. Azure OpenAI chat completions and
 Foundry Messages forward request bodies unchanged through Envoy. Azure Responses is
 explicitly rejected because its echo is the deployment name. The Bedrock Mantle
 candidate is limited to canonical `claude-opus-4-8` in `us-east-1` and requires
-the dedicated approved image feature plus registry admission of its raw model
-echo. Older images and unadmitted candidates remain unavailable. Selecting one per worker does
+the dedicated `bedrock-mantle-opus48-v2` approved image feature plus registry
+admission of the canonical miner response identity `claude-opus-4-8` under the versioned
+execution-policy contract. The measured adapter validates the raw provider response identity
+before content release and passes it through unchanged. Older images and unadmitted candidates
+remain unavailable. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/claude-opus-4-8` | AWS Bedrock Mantle | `--anthropic-upstream bedrock` — `us-east-1` only; requires approved `bedrock-mantle-opus48-v1` image and raw `claude-opus-4-8` registry admission |
+| `anthropic/claude-opus-4-8` | AWS Bedrock Mantle | `--anthropic-upstream bedrock` — `us-east-1` only; requires the approved `bedrock-mantle-opus48-v2` image, gateway admission of canonical miner response `claude-opus-4-8`, and miner validation of raw provider identity before content release under the versioned execution-policy contract |
 | `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
 | `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` — qualified measured transport; `/v1/responses` is rejected |
 

@@ -253,10 +253,11 @@ static_resources:
                             -- route discriminator until route actions remove it,
                             -- NEAR's and KubeTEE's validated selectors until their
                             -- loopback verifiers, Chutes' selector and ordinary marker,
-                            -- and Bedrock's exact route marker until its local adapter
-                            -- consumes it. The adapter builds a fresh AWS request.
+                            -- and a versioned execution policy only on the guarded
+                            -- loopback adapter route. The adapter builds the fixed
+                            -- upstream request itself.
                             local cfg = slot_config[provider]
-                            local keep_bedrock_route_marker = provider == "anthropic"
+                            local keep_execution_policy = provider == "anthropic"
                               and cfg ~= nil and cfg.no_retry
                               and headers:get(":method") == "POST"
                               and bare == "/v1/messages"
@@ -264,8 +265,8 @@ static_resources:
                             for name in pairs(headers) do
                               if name:sub(1, 5) == "x-gm-"
                                 and name ~= "x-gm-provider"
-                                and not (keep_bedrock_route_marker
-                                  and name == "x-gm-bedrock-mantle-opus48-route")
+                                and not (keep_execution_policy
+                                  and name == "x-gm-execution-policy")
                                 and not ((provider == "near" or provider == "chutes"
                                     or provider == "kubetee")
                                   and name == "x-gm-upstream-model")

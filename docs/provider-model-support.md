@@ -17,9 +17,12 @@ catalog. It distinguishes transport capability from registry admission:
   eligibility to the registry. Azure Responses is unqualified because its echo
   is the deployment name. The Bedrock Mantle candidate is limited to canonical
   `claude-opus-4-8` in `us-east-1`; it requires the
-  `bedrock-mantle-opus48-v1` approved image feature and registry admission of
-  the raw Mantle model echo. Older images and unadmitted candidates remain
-  unavailable. A known model id or successful HTTP probe is not sufficient.
+  `bedrock-mantle-opus48-v2` approved image feature and registry admission of
+  the canonical miner response identity `claude-opus-4-8` under the versioned
+  execution-policy contract. The measured adapter validates the raw provider
+  response identity before content release and passes it through unchanged.
+  Older images and unadmitted candidates remain unavailable. A known model id
+  or successful HTTP probe is not sufficient.
 
 Name each Azure OpenAI or Foundry deployment **exactly the canonical gm model id**.
 The image enumerates the bound account's deployments through ARM. Each deployment

@@ -28,7 +28,7 @@ use serde_json::{Map, Number, Value};
 use tokio::net::TcpListener;
 use tracing::info;
 
-pub const BEDROCK_MANTLE_FEATURE: &str = "bedrock-mantle-opus48-v1";
+pub const BEDROCK_MANTLE_FEATURE: &str = "bedrock-mantle-opus48-v2";
 pub const BEDROCK_MANTLE_BIND_ADDR: &str = "127.0.0.1:8085";
 pub const BEDROCK_MANTLE_HOST: &str = "bedrock-mantle.us-east-1.api.aws";
 pub const BEDROCK_MANTLE_PATH: &str = "/anthropic/v1/messages";
@@ -36,8 +36,8 @@ pub const BEDROCK_BUYER_MODEL: &str = "claude-opus-4-8";
 pub const BEDROCK_SYSTEM_MODEL: &str = "anthropic.claude-opus-4-8";
 pub const BEDROCK_RESPONSE_MODEL: &str = "claude-opus-4-8";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
-pub const BEDROCK_ROUTE_HEADER: &str = "x-gm-bedrock-mantle-opus48-route";
-const BEDROCK_ROUTE_MARKER: &str = "1";
+pub const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+pub const EXACT_CANONICAL_NO_REPLAY_POLICY: &str = "exact-canonical-no-replay-v1";
 
 const BEDROCK_MANTLE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages";
 const MAX_REQUEST_BODY: usize = 20 * 1024 * 1024;
@@ -320,9 +320,13 @@ async fn forward_request(
 }
 
 fn validate_inbound_headers(headers: &HeaderMap) -> Result<(), Reject> {
-    let mut route_markers = headers.get_all(BEDROCK_ROUTE_HEADER).iter();
-    if route_markers.next().and_then(|value| value.to_str().ok()) != Some(BEDROCK_ROUTE_MARKER)
-        || route_markers.next().is_some()
+    let mut execution_policies = headers.get_all(EXECUTION_POLICY_HEADER).iter();
+    if execution_policies
+        .next()
+        .and_then(|value| value.to_str().ok())
+        != Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
+        || execution_policies.next().is_some()
+        || headers.contains_key("x-gm-bedrock-mantle-opus48-route")
     {
         return Err(Reject::Header);
     }
@@ -1438,26 +1442,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_marker_must_be_single_and_exact_before_upstream_dispatch() {
+    async fn execution_policy_must_be_single_and_exact_before_upstream_dispatch() {
         let (state, calls) = test_state().await;
         let cases = [
             ("missing", {
                 let mut request = request("/v1/messages", VALID_BODY);
-                request.headers_mut().remove(BEDROCK_ROUTE_HEADER);
+                request.headers_mut().remove(EXECUTION_POLICY_HEADER);
                 request
             }),
             ("duplicate", {
                 let mut request = request("/v1/messages", VALID_BODY);
-                request
-                    .headers_mut()
-                    .append(BEDROCK_ROUTE_HEADER, HeaderValue::from_static("1"));
+                request.headers_mut().append(
+                    EXECUTION_POLICY_HEADER,
+                    HeaderValue::from_static(EXACT_CANONICAL_NO_REPLAY_POLICY),
+                );
                 request
             }),
             ("wrong value", {
                 let mut request = request("/v1/messages", VALID_BODY);
                 request
                     .headers_mut()
-                    .insert(BEDROCK_ROUTE_HEADER, HeaderValue::from_static("true"));
+                    .insert(EXECUTION_POLICY_HEADER, HeaderValue::from_static("true"));
+                request
+            }),
+            ("legacy marker only", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request.headers_mut().remove(EXECUTION_POLICY_HEADER);
+                request.headers_mut().insert(
+                    "x-gm-bedrock-mantle-opus48-route",
+                    HeaderValue::from_static("1"),
+                );
+                request
+            }),
+            ("legacy marker with valid policy", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request.headers_mut().insert(
+                    "x-gm-bedrock-mantle-opus48-route",
+                    HeaderValue::from_static("1"),
+                );
                 request
             }),
         ];
@@ -1562,7 +1584,7 @@ mod tests {
             Some(ANTHROPIC_VERSION)
         );
         assert!(headers.get("x-private").is_none());
-        assert!(headers.get(BEDROCK_ROUTE_HEADER).is_none());
+        assert!(headers.get(EXECUTION_POLICY_HEADER).is_none());
         upstream_task.abort();
     }
 
@@ -1572,7 +1594,7 @@ mod tests {
             .uri(uri)
             .header(CONTENT_TYPE, "application/json")
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header(BEDROCK_ROUTE_HEADER, BEDROCK_ROUTE_MARKER)
+            .header(EXECUTION_POLICY_HEADER, EXACT_CANONICAL_NO_REPLAY_POLICY)
             .body(Body::from(body.to_owned()))
             .expect("request")
     }

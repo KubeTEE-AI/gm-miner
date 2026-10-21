@@ -4,6 +4,8 @@ use anyhow::{bail, Context, Result};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
+use crate::cloud_policy::REVIEWED_BEDROCK_IMAGE_FEATURE;
+
 /// A single approved (`compose_hash`, `os_image_hash`) entry from the registry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageVersion {
@@ -47,14 +49,14 @@ impl ImageVersion {
         self.features.iter().any(|f| f == "upstream-model-hop")
     }
 
-    /// Only the image that contains the fixed Opus 4.8 Mantle adapter carries
-    /// this reviewed capability stamp. A generic cloud-hop stamp is not enough
-    /// to route Bedrock requests through the adapter.
+    /// Only the image that contains the fixed Opus 4.8 Mantle adapter with the
+    /// current execution-policy handshake carries this reviewed capability
+    /// stamp. The previous image stamp is intentionally not accepted.
     #[must_use]
     pub fn bedrock_mantle_opus48_capable(&self) -> bool {
         self.features
             .iter()
-            .any(|f| f == "bedrock-mantle-opus48-v1")
+            .any(|feature| feature == REVIEWED_BEDROCK_IMAGE_FEATURE)
     }
 }
 
@@ -270,6 +272,9 @@ mod tests {
         assert!(!version.bedrock_mantle_opus48_capable());
 
         version.features.push("bedrock-mantle-opus48-v1".to_owned());
+        assert!(!version.bedrock_mantle_opus48_capable());
+
+        version.features.push("bedrock-mantle-opus48-v2".to_owned());
         assert!(version.bedrock_mantle_opus48_capable());
     }
 

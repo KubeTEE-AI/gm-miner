@@ -19,6 +19,9 @@ use crate::{
 /// This does not authorize the worker's cloud transport.
 pub const REVIEWED_BEDROCK_PROVIDER: &str = "anthropic";
 pub const REVIEWED_BEDROCK_MODEL: &str = "claude-opus-4-8";
+/// Measured miner runtime revision that understands the generic execution-
+/// policy handshake. Earlier Bedrock image stamps do not authorize probes.
+pub const REVIEWED_BEDROCK_IMAGE_FEATURE: &str = "bedrock-mantle-opus48-v2";
 /// Bedrock is advertised with the canonical buyer selector. The measured
 /// Mantle adapter alone maps this value to the AWS selector.
 pub const REVIEWED_BEDROCK_UPSTREAM_MODEL: &str = "claude-opus-4-8";

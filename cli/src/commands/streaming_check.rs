@@ -15,6 +15,7 @@ use gm_miner_cli::{
         is_reviewed_bedrock_binding, REVIEWED_BEDROCK_MODEL, REVIEWED_BEDROCK_PROVIDER,
     },
     config::{Config, ProviderKeys, WorkerRecord},
+    deploy::{fetch_supported_versions, normalize_hash, ImageVersion},
     slots::parse_key_slots,
     types::{
         MinerStatus, Product, ProductCatalogResponse, Provider, SourceProduct, WorkerEntry,
@@ -35,8 +36,8 @@ const BUFFERED_BURST_SPAN: Duration = Duration::from_millis(250);
 const BUFFERED_FIRST_WAIT: Duration = Duration::from_secs(1);
 const BUFFERED_RATIO: f64 = 0.20;
 const MAX_TOKENS: u32 = 32;
-const BEDROCK_MANTLE_ROUTE_HEADER: &str = "x-gm-bedrock-mantle-opus48-route";
-const BEDROCK_MANTLE_ROUTE_MARKER: &str = "1";
+const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+const EXACT_CANONICAL_NO_REPLAY_POLICY: &str = "exact-canonical-no-replay-v1";
 
 const BUFFERED_GUIDANCE: &str = "Your {provider} upstream returned a buffered response: \
 the whole completion arrived in one burst instead of token-by-token. Buyers see slow \
@@ -58,7 +59,7 @@ enum StreamingVerdict {
     Inconclusive,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StreamingTarget {
     endpoint: String,
     node_secret: String,
@@ -72,6 +73,11 @@ struct StreamingTarget {
     /// miner-scoped offer carries a cloud upstream id. Cloud bindings are
     /// resolved against this map, never against the offer alone.
     worker_backends: HashMap<Provider, String>,
+    /// True only when the selected worker's measured compose hash maps to a
+    /// currently supported image carrying the execution-policy runtime stamp.
+    /// The immediate post-deploy advisory receives the already hash-verified
+    /// approval directly.
+    bedrock_policy_image_capable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -87,9 +93,9 @@ struct ProviderProbe {
     model: String,
     slot: Option<String>,
     fallback: bool,
-    /// Internal per-inference context. Set only after the selected worker's
-    /// Bedrock backend, canonical model, and authorized key slot are proven.
-    bedrock_mantle_route_marker: bool,
+    /// Versioned runtime policy. Set only after the selected worker's image,
+    /// exact model, backend, and authorized key slot are proven.
+    execution_policy: Option<&'static str>,
     path: &'static str,
     body: Value,
 }
@@ -147,7 +153,7 @@ struct ProbeTiming {
 
 struct ProbeRouteAuthorization {
     slot: Option<String>,
-    bedrock_mantle_route_marker: bool,
+    execution_policy: Option<&'static str>,
 }
 
 /// Runs the standalone streaming self-test against the miner's primary worker.
@@ -167,7 +173,12 @@ pub(crate) async fn cmd_check_streaming(cfg: Config) -> Result<()> {
 /// Deploy already has the fresh endpoint and node secret in hand, so this path
 /// avoids an extra registry lookup. Any error is printed as guidance and never
 /// fails the deploy that just succeeded.
-pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node_secret: &str) {
+pub(crate) async fn deploy_streaming_advisory(
+    cfg: &Config,
+    endpoint: &str,
+    node_secret: &str,
+    bedrock_policy_image_capable: bool,
+) {
     println!("\nStreaming self-test (advisory) ...");
     let target = StreamingTarget {
         endpoint: endpoint.to_owned(),
@@ -178,6 +189,7 @@ pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node
             .as_ref()
             .map(|keys| backends_from_config(&keys.worker_backends()))
             .unwrap_or_default(),
+        bedrock_policy_image_capable,
     };
     run_streaming_checks(cfg, &target).await;
 }
@@ -292,6 +304,16 @@ async fn check_provider_streaming(
         }
         return;
     }
+    if provider.as_str() == REVIEWED_BEDROCK_PROVIDER
+        && target.worker_backends.get(&provider).map(String::as_str) == Some("bedrock")
+        && !target.bedrock_policy_image_capable
+    {
+        println!(
+            "  [--] {provider}/{REVIEWED_BEDROCK_MODEL}: selected worker's measured image is not \
+             approved for the current execution policy; no policy probe sent"
+        );
+        return;
+    }
     for selected in models {
         if excluded.contains(&(
             provider.as_str().to_owned(),
@@ -312,17 +334,18 @@ async fn check_provider_streaming(
             continue;
         };
         let mut probe = build_probe(provider.clone(), &selected.model, route.slot);
-        probe.bedrock_mantle_route_marker = route.bedrock_mantle_route_marker;
+        probe.execution_policy = route.execution_policy;
         let result = run_provider_probe(target, &probe).await;
         print_probe_result(&probe, result);
     }
 }
 
-/// Authorize the internal route marker only when this probe has an exact
-/// Bedrock backend/model/slot binding. Standalone checks use the selected
-/// worker's registry-verified slot ownership; the immediate post-deploy
-/// advisory derives the slot from the key and node secret used for that
-/// deployment because registry slot status may not have arrived yet.
+/// Authorize the versioned execution policy only when the current image and
+/// this probe have an exact Bedrock backend/model/slot binding. Standalone
+/// checks use the selected worker's registry-verified slot ownership; the
+/// immediate post-deploy advisory derives the slot from the key and node
+/// secret used for that deployment because registry slot status may not have
+/// arrived yet.
 fn probe_route_authorization(
     cfg: &Config,
     target: &StreamingTarget,
@@ -334,11 +357,12 @@ fn probe_route_authorization(
     if !is_bedrock {
         return Some(ProbeRouteAuthorization {
             slot: selected.slot.clone(),
-            bedrock_mantle_route_marker: false,
+            execution_policy: None,
         });
     }
 
-    if selected.model.fallback
+    if !target.bedrock_policy_image_capable
+        || selected.model.fallback
         || selected.model.canonical != REVIEWED_BEDROCK_MODEL
         || selected.model.wire_model() != REVIEWED_BEDROCK_MODEL
     {
@@ -372,7 +396,7 @@ fn probe_route_authorization(
 
     Some(ProbeRouteAuthorization {
         slot: Some(slot),
-        bedrock_mantle_route_marker: true,
+        execution_policy: Some(EXACT_CANONICAL_NO_REPLAY_POLICY),
     })
 }
 
@@ -402,7 +426,37 @@ async fn resolve_primary_worker(cfg: &Config) -> Result<StreamingTarget> {
     }
     let workers: WorkerListResponse = resp.json().await.context("parse worker list response")?;
 
-    pick_target_worker(local, &workers.workers)
+    let mut target = pick_target_worker(local, &workers.workers)?;
+    if target
+        .worker_backends
+        .get(&Provider::Anthropic)
+        .map(String::as_str)
+        == Some("bedrock")
+    {
+        let current_compose_hash = first_live_worker_id(&workers.workers)
+            .and_then(|worker_id| {
+                workers
+                    .workers
+                    .iter()
+                    .find(|worker| worker.worker_id == worker_id)
+            })
+            .and_then(|worker| worker.image_compose_hash.as_deref())
+            .map(str::to_owned);
+        if let Some(compose_hash) = current_compose_hash {
+            match fetch_supported_versions(&cfg.api_url()).await {
+                Ok(versions) => {
+                    target.bedrock_policy_image_capable =
+                        image_has_bedrock_policy_feature(Some(&compose_hash), &versions);
+                }
+                // `fetch_supported_versions` includes response bodies in some
+                // errors. Keep registry error details out of CLI diagnostics.
+                Err(_) => {
+                    tracing::warn!("could not verify the selected Bedrock worker image feature");
+                }
+            }
+        }
+    }
+    Ok(target)
 }
 
 /// Pick which worker `check-streaming` probes: the oldest worker the
@@ -450,7 +504,36 @@ fn pick_target_worker(local: &[WorkerRecord], live: &[WorkerEntry]) -> Result<St
             .as_ref()
             .map(backends_from_config)
             .unwrap_or_default(),
+        bedrock_policy_image_capable: false,
     })
+}
+
+fn image_has_bedrock_policy_feature(
+    image_compose_hash: Option<&str>,
+    versions: &[ImageVersion],
+) -> bool {
+    let Some(image_compose_hash) = image_compose_hash else {
+        return false;
+    };
+    let image_compose_hash = normalize_hash(image_compose_hash);
+    if !is_sha256_hex(&image_compose_hash) {
+        return false;
+    }
+    let matching = versions
+        .iter()
+        .filter(|version| normalize_hash(&version.compose_hash) == image_compose_hash)
+        .collect::<Vec<_>>();
+    !matching.is_empty()
+        && matching.iter().all(|version| {
+            let version_hash = normalize_hash(&version.compose_hash);
+            version.status == "supported"
+                && is_sha256_hex(&version_hash)
+                && version.bedrock_mantle_opus48_capable()
+        })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn backends_from_config(
@@ -919,7 +1002,7 @@ fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> 
             model: model.canonical.clone(),
             slot,
             fallback: model.fallback,
-            bedrock_mantle_route_marker: false,
+            execution_policy: None,
             path: "/v1/messages",
             body: serde_json::json!({
                 "model": model.wire_model(),
@@ -957,7 +1040,7 @@ fn openai_compatible_probe(
         model: model.canonical.clone(),
         slot,
         fallback: model.fallback,
-        bedrock_mantle_route_marker: false,
+        execution_policy: None,
         path,
         body: serde_json::json!({
             "model": model.wire_model(),
@@ -992,8 +1075,8 @@ async fn run_provider_probe(
         request = request.header("x-gm-upstream-model", selector);
     }
     request = apply_upstream_slot(request, probe.slot.as_deref());
-    if probe.bedrock_mantle_route_marker {
-        request = request.header(BEDROCK_MANTLE_ROUTE_HEADER, BEDROCK_MANTLE_ROUTE_MARKER);
+    if let Some(execution_policy) = probe.execution_policy {
+        request = request.header(EXECUTION_POLICY_HEADER, execution_policy);
     }
     let mut response = request
         .json(&probe.body)
@@ -1287,13 +1370,14 @@ mod tests {
             node_secret: "secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let probe = ProviderProbe {
             provider: Provider::Kubetee,
             model: "zai/glm-5.3-tee".to_owned(),
             slot: None,
             fallback: false,
-            bedrock_mantle_route_marker: false,
+            execution_policy: None,
             path: "/v1/chat/completions",
             body: serde_json::json!({"model": "z-ai/glm-5.3", "stream": true}),
         };
@@ -1334,8 +1418,82 @@ mod tests {
         }
     }
 
+    fn image_version(compose_hash: &str, features: &[&str]) -> ImageVersion {
+        ImageVersion {
+            git_tag: None,
+            compose_hash: compose_hash.to_owned(),
+            os_image_hash: "os-hash".to_owned(),
+            status: "supported".to_owned(),
+            notes: None,
+            created_at: "2026-10-21T00:00:00Z".to_owned(),
+            image_ref: None,
+            features: features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bedrock_policy_feature_must_match_the_selected_current_image() {
+        let old_hash = "a".repeat(64);
+        let current_hash = "b".repeat(64);
+        let no_feature_hash = "c".repeat(64);
+        let blocked_hash = "d".repeat(64);
+        let old = image_version(&old_hash, &["bedrock-mantle-opus48-v1"]);
+        let current = image_version(&current_hash, &["bedrock-mantle-opus48-v2"]);
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&old_hash),
+            &[old.clone(), current.clone()]
+        ));
+        assert!(image_has_bedrock_policy_feature(
+            Some(&current_hash),
+            &[old.clone(), current.clone()]
+        ));
+
+        let no_feature = image_version(&no_feature_hash, &[]);
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&no_feature_hash),
+            &[no_feature]
+        ));
+
+        let mut blocked = image_version(&blocked_hash, &["bedrock-mantle-opus48-v2"]);
+        blocked.status = "blocked".to_owned();
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&blocked_hash),
+            &[blocked]
+        ));
+
+        // A duplicate compose hash is ambiguous if any matching row still
+        // carries the old measurement stamp.
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&current_hash),
+            &[
+                current.clone(),
+                image_version(&current_hash, &["bedrock-mantle-opus48-v1"]),
+            ]
+        ));
+
+        assert!(!image_has_bedrock_policy_feature(
+            None,
+            std::slice::from_ref(&current)
+        ));
+        assert!(!image_has_bedrock_policy_feature(
+            Some(""),
+            &[image_version("", &["bedrock-mantle-opus48-v2",])]
+        ));
+        assert!(!image_has_bedrock_policy_feature(
+            Some("not-a-sha256"),
+            &[image_version("not-a-sha256", &["bedrock-mantle-opus48-v2"])],
+        ));
+        assert!(!image_has_bedrock_policy_feature(
+            Some(&"e".repeat(64)),
+            &[image_version(&current_hash, &["bedrock-mantle-opus48-v2"])],
+        ));
+    }
+
     #[tokio::test]
-    async fn qualified_bedrock_probe_sends_marker_and_registry_verified_slot() {
+    async fn qualified_bedrock_probe_sends_execution_policy_and_registry_verified_slot() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1352,8 +1510,8 @@ mod tests {
             .and(header("x-gm-provider", REVIEWED_BEDROCK_PROVIDER))
             .and(header("x-gm-upstream-slot", slot.as_str()))
             .and(header(
-                BEDROCK_MANTLE_ROUTE_HEADER,
-                BEDROCK_MANTLE_ROUTE_MARKER,
+                EXECUTION_POLICY_HEADER,
+                EXACT_CANONICAL_NO_REPLAY_POLICY,
             ))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1378,22 +1536,45 @@ mod tests {
                 },
             )])),
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: true,
         };
         let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
             .expect("worker model ownership")
             .remove(0);
+        let mut stale_image = target.clone();
+        stale_image.bedrock_policy_image_capable = false;
+        assert!(probe_route_authorization(
+            &Config::default(),
+            &stale_image,
+            &Provider::Anthropic,
+            &selected
+        )
+        .is_none());
         let route =
             probe_route_authorization(&Config::default(), &target, &Provider::Anthropic, &selected)
-                .expect("verified Bedrock slot authorizes marker");
+                .expect("current image and verified Bedrock slot authorize policy");
         assert_eq!(route.slot.as_deref(), Some(slot.as_str()));
-        assert!(route.bedrock_mantle_route_marker);
+        assert_eq!(
+            route.execution_policy,
+            Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
+        );
 
         let mut probe = build_probe(Provider::Anthropic, &selected.model, route.slot);
-        probe.bedrock_mantle_route_marker = route.bedrock_mantle_route_marker;
+        probe.execution_policy = route.execution_policy;
         assert_eq!(probe.body["model"], REVIEWED_BEDROCK_MODEL);
         run_provider_probe(&target, &probe)
             .await
-            .expect("mock requires route marker and verified slot");
+            .expect("mock requires execution policy and verified slot");
+        check_provider_streaming(
+            &Config::default(),
+            &stale_image,
+            Provider::Anthropic,
+            &ProbeModels {
+                models: HashMap::from([(Provider::Anthropic, vec![bedrock_model()])]),
+            },
+            &BTreeSet::new(),
+        )
+        .await;
     }
 
     #[test]
@@ -1404,6 +1585,7 @@ mod tests {
             node_secret: "just-deployed-node-secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: true,
         };
         let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
             .expect("post-deploy configuration is authoritative")
@@ -1419,7 +1601,10 @@ mod tests {
         )
         .expect("HMAC slot");
         assert_eq!(route.slot.as_deref(), Some(expected.as_str()));
-        assert!(route.bedrock_mantle_route_marker);
+        assert_eq!(
+            route.execution_policy,
+            Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
+        );
     }
 
     #[tokio::test]
@@ -1436,6 +1621,7 @@ mod tests {
                 unscoped_coverage(&[REVIEWED_BEDROCK_MODEL]),
             )])),
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: true,
         };
         let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
             .expect("provider-wide models are known")
@@ -1500,6 +1686,7 @@ mod tests {
                 unscoped_coverage(&[REVIEWED_BEDROCK_MODEL]),
             )])),
             worker_backends: HashMap::from([(Provider::Anthropic, "foundry".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
         check_provider_streaming(
             &cfg,
@@ -1517,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_anthropic_probe_never_sends_bedrock_route_marker() {
+    async fn direct_anthropic_probe_never_sends_execution_policy() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1525,7 +1712,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(|request: &wiremock::Request| {
-                !request.headers.contains_key(BEDROCK_MANTLE_ROUTE_HEADER)
+                !request.headers.contains_key(EXECUTION_POLICY_HEADER)
             })
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1547,18 +1734,19 @@ mod tests {
                 unscoped_coverage(&[REVIEWED_BEDROCK_MODEL]),
             )])),
             worker_backends: HashMap::from([(Provider::Anthropic, "direct".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
         let selected = models_for_target(&target, &Provider::Anthropic, vec![bedrock_model()])
             .expect("direct worker can probe its canonical model")
             .remove(0);
         let route = probe_route_authorization(&cfg, &target, &Provider::Anthropic, &selected)
             .expect("ordinary direct route");
-        assert!(!route.bedrock_mantle_route_marker);
+        assert_eq!(route.execution_policy, None);
         let mut probe = build_probe(Provider::Anthropic, &selected.model, route.slot);
-        probe.bedrock_mantle_route_marker = route.bedrock_mantle_route_marker;
+        probe.execution_policy = route.execution_policy;
         run_provider_probe(&target, &probe)
             .await
-            .expect("direct request has no Bedrock marker");
+            .expect("direct request has no execution policy");
     }
 
     #[test]
@@ -2176,6 +2364,7 @@ mod tests {
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let providers = providers_for_target(
             &[Provider::DeepInfra, Provider::Engy, Provider::OpenAI],
@@ -2229,6 +2418,7 @@ mod tests {
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let models = vec![
             ProbeModel {
@@ -2274,6 +2464,7 @@ mod tests {
                 },
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let models = vec![
             ProbeModel {
@@ -2330,6 +2521,7 @@ mod tests {
                 },
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let models = vec![ProbeModel {
             canonical: "qwen3.8-27b".to_owned(),
@@ -2360,6 +2552,7 @@ mod tests {
                 unscoped_coverage(&["claude-sonnet-4-6"]),
             )])),
             worker_backends: HashMap::from([(Provider::Anthropic, "direct".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
 
         let selected = models_for_target(
@@ -2379,6 +2572,7 @@ mod tests {
             node_secret: "secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
         let selected = models_for_target(
             &target,
@@ -2403,6 +2597,7 @@ mod tests {
             node_secret: "secret".to_owned(),
             provider_models: None,
             worker_backends: HashMap::from([(Provider::Anthropic, "bedrock".to_owned())]),
+            bedrock_policy_image_capable: false,
         };
         let rejected = [
             ProbeModel {
@@ -2451,6 +2646,7 @@ mod tests {
                     unscoped_coverage(&[model]),
                 )])),
                 worker_backends: HashMap::from([(provider.clone(), backend.to_owned())]),
+                bedrock_policy_image_capable: false,
             };
             let models = vec![ProbeModel {
                 canonical: model.to_owned(),
@@ -2474,6 +2670,7 @@ mod tests {
                 unscoped_coverage(&["qwen3.8-27b"]),
             )])),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         let fallback = vec![ProbeModel {
             canonical: "glm-5.2".to_owned(),
@@ -2493,6 +2690,7 @@ mod tests {
             node_secret: "secret".to_owned(),
             provider_models: Some(HashMap::new()),
             worker_backends: HashMap::new(),
+            bedrock_policy_image_capable: false,
         };
         assert_eq!(
             providers_for_target(&[Provider::Engy], &target),

@@ -14,9 +14,12 @@ admission: Azure OpenAI chat completions and Foundry Messages are qualified only
 image's `upstream-model-hop` feature and the registry's `upstream-model-echo` capability are
 both present. Azure Responses is unqualified because its echo is the deployment name. The
 Bedrock Mantle candidate is limited to `claude-opus-4-8` in `us-east-1`; it requires the
-dedicated approved image feature `bedrock-mantle-opus48-v1` and registry admission of its raw
-model echo. Older images and unadmitted candidates remain unavailable. Direct
-Anthropic/OpenAI routes use verified key slots enforced by the miner runtime. The `gmcli` tool
+dedicated approved image feature `bedrock-mantle-opus48-v2` and registry admission of the
+canonical miner response identity `claude-opus-4-8` under the versioned execution-policy
+contract. The measured adapter validates the raw provider response identity before content
+release and passes it through unchanged; it already equals the canonical identity. Older
+images and unadmitted candidates remain unavailable. Direct Anthropic/OpenAI routes use
+verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
 | Path | Description |
@@ -200,7 +203,10 @@ Cloud registration, recovery and declaration require registry capability
 `upstream-model-hop`. These contract names are unchanged. The gateway checks each response's
 model echo. Azure Responses still returns a typed JSON 400 because its echo identifies the
 deployment name. The Bedrock Mantle candidate is limited to Opus 4.8 in `us-east-1` and needs
-its dedicated approved image feature plus registry admission of the raw response model echo.
+its dedicated `bedrock-mantle-opus48-v2` approved image feature plus registry
+admission of the canonical miner response identity `claude-opus-4-8` under the versioned
+execution-policy contract. The measured adapter validates the raw provider response identity
+before content release and passes it through unchanged.
 Azure OpenAI and Foundry each accept exactly one HMAC slot derived from their single cloud key;
 all other slot ids return 421. Cloud keys cannot contain semicolons.
 

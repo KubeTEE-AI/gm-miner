@@ -624,16 +624,8 @@ pub(crate) async fn cmd_deploy(
              feature; select an image with cloud model binding or wait for this image to be admitted"
         );
     }
-    if worker_backends
-        .get("anthropic")
-        .is_some_and(|backend| backend == "bedrock")
-        && !image_is_bedrock_mantle_opus48_capable(args, approved, &versions)
-    {
-        anyhow::bail!(
-            "Bedrock requires a registry-approved image with the `bedrock-mantle-opus48-v1` \
-             feature; old or locally built images cannot serve this route"
-        );
-    }
+    let bedrock_policy_image_capable =
+        require_bedrock_policy_image(&worker_backends, args, approved, &versions)?;
     let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
     // Reject incompatible templates/images before creating a billable CVM.
     let expected = gm_miner_cli::deploy::DstackDeployResult {
@@ -693,8 +685,34 @@ pub(crate) async fn cmd_deploy(
     record.provisional_secondary = false;
     persist_worker_record(cfg.active_network(), record.clone())?;
     print_deploy_summary(&record.worker_id, &actual.app_id, registration);
-    deploy_streaming_advisory(cfg, &actual.endpoint, &record.node_secret).await;
+    deploy_streaming_advisory(
+        cfg,
+        &actual.endpoint,
+        &record.node_secret,
+        bedrock_policy_image_capable,
+    )
+    .await;
     Ok(())
+}
+
+fn require_bedrock_policy_image(
+    worker_backends: &std::collections::BTreeMap<String, String>,
+    args: &DeployArgs,
+    approved: &gm_miner_cli::deploy::ImageVersion,
+    versions: &[gm_miner_cli::deploy::ImageVersion],
+) -> Result<bool> {
+    let capable = image_is_bedrock_mantle_opus48_capable(args, approved, versions);
+    if worker_backends
+        .get("anthropic")
+        .is_some_and(|backend| backend == "bedrock")
+        && !capable
+    {
+        anyhow::bail!(
+            "Bedrock requires a registry-approved image with the `bedrock-mantle-opus48-v2` \
+             feature; old or locally built images cannot serve this route"
+        );
+    }
+    Ok(capable)
 }
 
 async fn deploy_preflight<'a>(
@@ -1394,7 +1412,7 @@ mod tests {
 
         approved
             .features
-            .push("bedrock-mantle-opus48-v1".to_owned());
+            .push("bedrock-mantle-opus48-v2".to_owned());
         assert!(image_is_bedrock_mantle_opus48_capable(
             &deploy_args(),
             &approved,

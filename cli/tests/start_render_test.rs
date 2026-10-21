@@ -348,6 +348,9 @@ fn azure_responses_is_rejected_with_the_typed_400() {
 
 #[test]
 fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
+    const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+    const EXECUTION_POLICY: &str = "exact-canonical-no-replay-v1";
+
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),
         ("BEDROCK_REGION", "us-east-1"),
@@ -372,6 +375,11 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
         .expect("exact Bedrock Messages POST route");
     assert_eq!(selected["route"]["cluster"], "bedrock_mantle_adapter");
     assert!(selected["route"]["retry_policy"].is_null());
+    assert!(!selected["request_headers_to_add"]
+        .as_array()
+        .expect("added headers")
+        .iter()
+        .any(|header| header["header"]["key"] == EXECUTION_POLICY_HEADER));
     assert!(selected["request_headers_to_remove"]
         .as_array()
         .expect("removed headers")
@@ -394,6 +402,7 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
             ("x-gm-provider", "anthropic"),
             ("x-gm-node-key", "test-node-secret-0001"),
             ("x-gm-upstream-slot", &bedrock_slot),
+            (EXECUTION_POLICY_HEADER, EXECUTION_POLICY),
             ("x-gm-bedrock-mantle-opus48-route", "1"),
             ("x-envoy-retry-on", "5xx"),
         ],
@@ -411,30 +420,38 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
         .expect("forwarded headers");
     assert_eq!(
         forwarded_headers
-            .get::<Option<String>>("x-gm-bedrock-mantle-opus48-route")
-            .expect("Bedrock route marker"),
-        Some("1".to_owned())
+            .get::<Option<String>>(EXECUTION_POLICY_HEADER)
+            .expect("execution policy"),
+        Some(EXECUTION_POLICY.to_owned())
     );
+    assert!(forwarded_headers
+        .get::<Option<String>>("x-gm-bedrock-mantle-opus48-route")
+        .expect("stripped legacy route marker")
+        .is_none());
     assert!(forwarded_headers
         .get::<Option<String>>("x-envoy-retry-on")
         .expect("retry header")
         .is_none());
+}
 
-    let (direct_status, _, direct_stderr, direct_rendered) =
-        render_envoy([("ANTHROPIC_API_KEY", "direct-key")]);
-    assert!(direct_status.success(), "render failed: {direct_stderr}");
+#[test]
+fn direct_anthropic_route_strips_the_generic_execution_policy() {
+    const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
+    const EXECUTION_POLICY: &str = "exact-canonical-no-replay-v1";
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "direct-key")]);
+    assert!(status.success(), "render failed: {stderr}");
     let direct_slot =
         gm_miner_cli::slots::derive_slot_id("anthropic", "direct-key", "test-node-secret-0001")
             .expect("direct Anthropic slot");
     let direct_lua = run_request(
-        &direct_rendered,
+        &rendered,
         &[
             (":method", "POST"),
             (":path", "/v1/messages"),
             ("x-gm-provider", "anthropic"),
             ("x-gm-node-key", "test-node-secret-0001"),
             ("x-gm-upstream-slot", &direct_slot),
-            ("x-gm-bedrock-mantle-opus48-route", "1"),
+            (EXECUTION_POLICY_HEADER, EXECUTION_POLICY),
         ],
         &[("GM_ANTHROPIC_KEY_SLOT_1", "direct-key")],
     );
@@ -443,8 +460,8 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
         .get::<mlua::Table>("input_headers")
         .expect("direct headers");
     assert!(direct_headers
-        .get::<Option<String>>("x-gm-bedrock-mantle-opus48-route")
-        .expect("stripped direct marker")
+        .get::<Option<String>>(EXECUTION_POLICY_HEADER)
+        .expect("stripped direct execution policy")
         .is_none());
 }
 
