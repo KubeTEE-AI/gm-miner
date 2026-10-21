@@ -545,10 +545,28 @@ enum Reject {
     BindingRevision,
     BindingsUnavailable,
     Upstream,
+    UpstreamTransport,
+    UpstreamHttp(u16),
+    ModelIdentityMismatch,
 }
 
 impl Reject {
+    // Fixed categories only: never log provider bodies, model strings, headers,
+    // credentials, or request content. Public error bodies remain unchanged.
+    fn upstream_diagnostic(self) -> Option<(&'static str, Option<u16>)> {
+        match self {
+            Self::Upstream => Some(("upstream_response_invalid", None)),
+            Self::UpstreamTransport => Some(("upstream_transport_failed", None)),
+            Self::UpstreamHttp(status) => Some(("upstream_http_rejected", Some(status))),
+            Self::ModelIdentityMismatch => Some(("model_identity_mismatch", None)),
+            _ => None,
+        }
+    }
+
     fn into_response(self) -> Response<Body> {
+        if let Some((reason, upstream_status)) = self.upstream_diagnostic() {
+            tracing::warn!(reason, upstream_status, "Bedrock Mantle request rejected");
+        }
         let (status, error_type, message) = match self {
             Self::Method => (
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -590,7 +608,10 @@ impl Reject {
                 "api_error",
                 "Bedrock model bindings are unavailable or stale",
             ),
-            Self::Upstream => (
+            Self::Upstream
+            | Self::UpstreamTransport
+            | Self::UpstreamHttp(_)
+            | Self::ModelIdentityMismatch => (
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 "Bedrock Mantle request failed",
@@ -671,7 +692,7 @@ async fn forward_request(
         .client
         .execute(upstream_request)
         .await
-        .map_err(|_| Reject::Upstream)?;
+        .map_err(|_| Reject::UpstreamTransport)?;
 
     finish_upstream_response(upstream, &binding, stream_response).await
 }
@@ -682,7 +703,7 @@ async fn finish_upstream_response(
     stream_response: bool,
 ) -> Result<Response<Body>, Reject> {
     if upstream.status() != StatusCode::OK {
-        return Err(Reject::Upstream);
+        return Err(Reject::UpstreamHttp(upstream.status().as_u16()));
     }
     if stream_response {
         let content_type = upstream
@@ -1213,7 +1234,7 @@ async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, R
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| Reject::Upstream)?;
+        let chunk = chunk.map_err(|_| Reject::UpstreamTransport)?;
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY {
             return Err(Reject::Upstream);
         }
@@ -1229,8 +1250,12 @@ fn canonicalize_response_identity(
 ) -> Result<Vec<u8>, Reject> {
     let mut value = parse_unique_json(bytes).map_err(|_| Reject::Upstream)?;
     let object = value.as_object_mut().ok_or(Reject::Upstream)?;
-    if object.get("model").and_then(Value::as_str) != Some(expected_raw_model) {
-        return Err(Reject::Upstream);
+    let raw_model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(Reject::Upstream)?;
+    if raw_model != expected_raw_model {
+        return Err(Reject::ModelIdentityMismatch);
     }
     object.insert(
         "model".to_owned(),
@@ -1253,7 +1278,7 @@ async fn validate_stream_identity(
         let Some(next) = source.next().await else {
             return Err(Reject::Upstream);
         };
-        let chunk = next.map_err(|_| Reject::Upstream)?;
+        let chunk = next.map_err(|_| Reject::UpstreamTransport)?;
         buffer.extend_from_slice(&chunk);
         loop {
             let Some((frame_end, separator_end)) = find_sse_frame(&buffer[scanned..]) else {
@@ -1536,8 +1561,12 @@ fn parse_sse_preamble_frame(
         .get_mut("message")
         .and_then(Value::as_object_mut)
         .ok_or(Reject::Upstream)?;
-    if message.get("model").and_then(Value::as_str) != Some(expected_raw_model) {
-        return Err(Reject::Upstream);
+    let raw_model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(Reject::Upstream)?;
+    if raw_model != expected_raw_model {
+        return Err(Reject::ModelIdentityMismatch);
     }
     message.insert(
         "model".to_owned(),
@@ -2021,6 +2050,100 @@ mod tests {
     }
 
     #[test]
+    fn identity_mismatch_is_distinct_from_malformed_upstream() {
+        let wrong = canonicalize_response_identity(
+            br#"{"model":"different-model"}"#,
+            TEST_RESPONSE_MODEL_A,
+            TEST_MODEL_A,
+        )
+        .expect_err("wrong identity");
+        let malformed =
+            canonicalize_response_identity(b"not json", TEST_RESPONSE_MODEL_A, TEST_MODEL_A)
+                .expect_err("malformed JSON");
+        assert_ne!(
+            wrong, malformed,
+            "identity rejection must be diagnostically distinct"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_preserve_content_free_public_errors() {
+        for (failure, reason, status) in [
+            (Reject::Upstream, "upstream_response_invalid", None),
+            (Reject::UpstreamTransport, "upstream_transport_failed", None),
+            (
+                Reject::UpstreamHttp(403),
+                "upstream_http_rejected",
+                Some(403),
+            ),
+            (
+                Reject::ModelIdentityMismatch,
+                "model_identity_mismatch",
+                None,
+            ),
+        ] {
+            assert_eq!(failure.upstream_diagnostic(), Some((reason, status)));
+            let response = failure.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = to_bytes(response.into_body(), 4096)
+                .await
+                .expect("error body");
+            assert_eq!(
+                body.as_ref(),
+                br#"{"error":{"type":"api_error","message":"Bedrock Mantle request failed"}}"#
+            );
+        }
+        assert_eq!(Reject::InvalidBody.upstream_diagnostic(), None);
+        assert_eq!(
+            canonicalize_response_identity(
+                br#"{"content":[]}"#,
+                TEST_RESPONSE_MODEL_A,
+                TEST_MODEL_A
+            ),
+            Err(Reject::Upstream)
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_response_bodies_are_transport_failures() {
+        let failed = || {
+            stream::iter([Err::<Bytes, io::Error>(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "private transport details",
+            ))])
+        };
+        let response = reqwest::Response::from(
+            Response::builder()
+                .status(200)
+                .body(reqwest::Body::wrap_stream(failed()))
+                .expect("HTTP response"),
+        );
+        assert_eq!(
+            read_bounded_response(response).await,
+            Err(Reject::UpstreamTransport)
+        );
+        assert!(matches!(
+            validate_stream_identity(failed().boxed(), TEST_RESPONSE_MODEL_A, TEST_MODEL_A).await,
+            Err(Reject::UpstreamTransport)
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_http_rejection_is_not_an_identity_mismatch() {
+        let binding = test_bindings_payload().bindings[TEST_MODEL_A].clone();
+        let upstream = reqwest::Response::from(
+            Response::builder()
+                .status(403)
+                .body("private provider error details")
+                .expect("HTTP response"),
+        );
+        let failure = finish_upstream_response(upstream, &binding, false)
+            .await
+            .expect_err("upstream rejection");
+        assert_eq!(failure, Reject::UpstreamHttp(403));
+    }
+
+    #[test]
     fn response_identity_is_checked_raw_then_canonicalized() {
         let correct = br#"{"id":"msg_1","type":"message","model":"test-model-a-provider-echo","content":[],"stop_reason":"end_turn"}"#;
         let canonical =
@@ -2031,7 +2154,7 @@ mod tests {
         let wrong = br#"{"model":"test-model-a-v2"}"#;
         assert_eq!(
             canonicalize_response_identity(wrong, TEST_RESPONSE_MODEL_A, TEST_MODEL_A),
-            Err(Reject::Upstream)
+            Err(Reject::ModelIdentityMismatch)
         );
         let duplicate = br#"{"model":"test-model-a-provider-echo","model":"test-model-a-v2"}"#;
         assert_eq!(
@@ -2044,11 +2167,10 @@ mod tests {
     async fn stream_is_not_released_before_the_identity_event() {
         let wrong = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a-v2\"}}\n\n";
         let chunks = stream::iter([Ok(Bytes::copy_from_slice(wrong))]).boxed();
-        assert!(
-            validate_stream_identity(chunks, TEST_RESPONSE_MODEL_A, TEST_MODEL_A)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            validate_stream_identity(chunks, TEST_RESPONSE_MODEL_A, TEST_MODEL_A).await,
+            Err(Reject::ModelIdentityMismatch)
+        ));
         let duplicate = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a-provider-echo\",\"model\":\"test-model-a-v2\"}}\n\n";
         let chunks = stream::iter([Ok(Bytes::copy_from_slice(duplicate))]).boxed();
         assert!(
