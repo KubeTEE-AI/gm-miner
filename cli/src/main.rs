@@ -355,8 +355,8 @@ enum Command {
         #[arg(long)]
         model: String,
 
-        /// Legacy upstream model id for transport diagnostics. The Bedrock
-        /// Mantle candidate uses the canonical Opus 4.8 id; omit this option.
+        /// Legacy upstream model id for transport diagnostics. Bedrock selector
+        /// mappings come from the network's registry; omit this option.
         #[arg(long = "upstream-model", value_name = "ID")]
         upstream_model: Option<String>,
 

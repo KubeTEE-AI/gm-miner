@@ -496,16 +496,17 @@ fn image_is_cloud_binding_capable(
     approved.cloud_binding_capable()
 }
 
-/// Whether the exact image that will run has the dedicated Opus 4.8 Mantle
-/// adapter stamp. Generic cloud model-hop support does not authorize Bedrock.
-fn image_is_bedrock_mantle_opus48_capable(
+/// Whether the exact image that will run has the generic dynamic Bedrock
+/// binding adapter stamp. Generic cloud model-hop support does not authorize
+/// Bedrock.
+fn image_is_bedrock_mantle_capable(
     args: &DeployArgs,
     approved: &ImageVersion,
     versions: &[ImageVersion],
 ) -> bool {
     if (args.image_ref.is_none() && args.image_repo.is_some())
         || approved.status != "supported"
-        || !approved.bedrock_mantle_opus48_capable()
+        || !approved.bedrock_mantle_model_bindings_capable()
     {
         return false;
     }
@@ -542,7 +543,7 @@ fn image_is_bedrock_mantle_opus48_capable(
     matching.peek().is_some()
         && matching.all(|version| {
             version.status == "supported"
-                && version.bedrock_mantle_opus48_capable()
+                && version.bedrock_mantle_model_bindings_capable()
                 && version.image_ref.as_deref() == Some(image_ref)
         })
 }
@@ -733,14 +734,14 @@ fn require_bedrock_policy_image(
     approved: &gm_miner_cli::deploy::ImageVersion,
     versions: &[gm_miner_cli::deploy::ImageVersion],
 ) -> Result<bool> {
-    let capable = image_is_bedrock_mantle_opus48_capable(args, approved, versions);
+    let capable = image_is_bedrock_mantle_capable(args, approved, versions);
     if worker_backends
         .get("anthropic")
         .is_some_and(|backend| backend == "bedrock")
         && !capable
     {
         anyhow::bail!(
-            "Bedrock requires a registry-approved image with the `bedrock-mantle-opus48-v2` \
+            "Bedrock requires a registry-approved image with the `bedrock-mantle-model-bindings-v1` \
              feature; old or locally built images cannot serve this route"
         );
     }
@@ -1434,19 +1435,19 @@ mod tests {
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
-            features: vec!["bedrock-mantle-opus48-v1".to_owned()],
+            features: vec!["bedrock-mantle-model-bindings-v0".to_owned()],
         };
         let mut args = deploy_args();
         args.image_ref.clone_from(&approved.image_ref);
         let current = ImageVersion {
-            features: vec!["bedrock-mantle-opus48-v2".to_owned()],
+            features: vec!["bedrock-mantle-model-bindings-v1".to_owned()],
             ..approved.clone()
         };
         let other_os = ImageVersion {
             os_image_hash: "c".repeat(64),
             ..current.clone()
         };
-        assert!(!image_is_bedrock_mantle_opus48_capable(
+        assert!(!image_is_bedrock_mantle_capable(
             &args,
             &approved,
             &[approved.clone(), other_os.clone()]
@@ -1458,12 +1459,12 @@ mod tests {
             &[approved.clone(), other_os]
         )
         .is_err());
-        assert!(image_is_bedrock_mantle_opus48_capable(
+        assert!(image_is_bedrock_mantle_capable(
             &args,
             &current,
             std::slice::from_ref(&current)
         ));
-        assert!(!image_is_bedrock_mantle_opus48_capable(
+        assert!(!image_is_bedrock_mantle_capable(
             &args,
             &current,
             &[current.clone(), approved.clone()]
@@ -1472,7 +1473,7 @@ mod tests {
             os_image_hash: "c".repeat(64),
             ..approved
         };
-        assert!(image_is_bedrock_mantle_opus48_capable(
+        assert!(image_is_bedrock_mantle_capable(
             &args,
             &current,
             &[current.clone(), older_other_os]
@@ -1495,25 +1496,21 @@ mod tests {
                 ..current.clone()
             },
         ] {
-            assert!(!image_is_bedrock_mantle_opus48_capable(
+            assert!(!image_is_bedrock_mantle_capable(
                 &args,
                 &invalid,
                 std::slice::from_ref(&invalid)
             ));
         }
-        assert!(!image_is_bedrock_mantle_opus48_capable(
-            &args,
-            &current,
-            &[]
-        ));
+        assert!(!image_is_bedrock_mantle_capable(&args, &current, &[]));
         args.image_repo = Some("local/image".to_owned());
-        assert!(image_is_bedrock_mantle_opus48_capable(
+        assert!(image_is_bedrock_mantle_capable(
             &args,
             &current,
             std::slice::from_ref(&current)
         ));
         args.image_ref = None;
-        assert!(!image_is_bedrock_mantle_opus48_capable(
+        assert!(!image_is_bedrock_mantle_capable(
             &args,
             &current,
             std::slice::from_ref(&current)
@@ -1532,7 +1529,7 @@ mod tests {
             image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
             features: vec!["upstream-model-hop".to_owned()],
         };
-        assert!(!image_is_bedrock_mantle_opus48_capable(
+        assert!(!image_is_bedrock_mantle_capable(
             &deploy_args(),
             &approved,
             std::slice::from_ref(&approved)
@@ -1540,8 +1537,8 @@ mod tests {
 
         approved
             .features
-            .push("bedrock-mantle-opus48-v2".to_owned());
-        assert!(image_is_bedrock_mantle_opus48_capable(
+            .push("bedrock-mantle-model-bindings-v1".to_owned());
+        assert!(image_is_bedrock_mantle_capable(
             &deploy_args(),
             &approved,
             std::slice::from_ref(&approved)
@@ -1554,7 +1551,7 @@ mod tests {
             features: vec!["upstream-model-hop".to_owned()],
             ..approved
         };
-        assert!(!image_is_bedrock_mantle_opus48_capable(
+        assert!(!image_is_bedrock_mantle_capable(
             &args,
             &explicit_old_image,
             std::slice::from_ref(&explicit_old_image)

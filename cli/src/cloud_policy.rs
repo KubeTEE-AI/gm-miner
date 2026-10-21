@@ -15,17 +15,6 @@ use crate::{
     types::{MinerStatus, WorkerEntry, WorkerListResponse},
 };
 
-/// The only Bedrock buyer model the measured Mantle image serves.
-/// This does not authorize the worker's cloud transport.
-pub const REVIEWED_BEDROCK_PROVIDER: &str = "anthropic";
-pub const REVIEWED_BEDROCK_MODEL: &str = "claude-opus-4-8";
-/// Measured miner runtime revision that understands the generic execution-
-/// policy handshake. Earlier Bedrock image stamps do not authorize probes.
-pub const REVIEWED_BEDROCK_IMAGE_FEATURE: &str = "bedrock-mantle-opus48-v2";
-/// Bedrock is advertised with the canonical buyer selector. The measured
-/// Mantle adapter alone maps this value to the AWS selector.
-pub const REVIEWED_BEDROCK_UPSTREAM_MODEL: &str = "claude-opus-4-8";
-
 /// The declaration decision has two independent consequences. A live worker
 /// may need the registry's model-echo compatibility check while still being
 /// a known-direct worker that is safe to keep in a bulk declaration.
@@ -50,16 +39,6 @@ impl CloudDeclarationPolicy {
         requires_capability: true,
         exclude_from_bulk: false,
     };
-}
-
-/// Return true only for the canonical Bedrock provider/model tuple. This is
-/// not routing admission; the worker's actual backend also needs independently
-/// verified provenance.
-#[must_use]
-pub fn is_reviewed_bedrock_binding(provider: &str, model: &str, upstream_model: &str) -> bool {
-    provider == REVIEWED_BEDROCK_PROVIDER
-        && model == REVIEWED_BEDROCK_MODEL
-        && upstream_model == REVIEWED_BEDROCK_UPSTREAM_MODEL
 }
 
 /// The explicitly selected cloud adapter for `provider` in the local config.
@@ -291,35 +270,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, NetworkEntry, ProviderKeys, WorkerRecord};
     use std::collections::{BTreeMap, HashMap};
-
-    #[test]
-    fn only_the_canonical_opus_48_bedrock_tuple_is_recognized() {
-        assert!(is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-opus-4-8",
-            "claude-opus-4-8"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-opus-4-8",
-            "anthropic.claude-opus-4-8"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-sonnet-4-6",
-            "claude-opus-4-8"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "openai",
-            "claude-opus-4-8",
-            "claude-opus-4-8"
-        ));
-        assert!(!is_reviewed_bedrock_binding(
-            "anthropic",
-            "claude-opus-4-8",
-            "anthropic.claude-opus-4-8"
-        ));
-    }
 
     #[test]
     fn selected_cloud_adapter_blocks_bulk_supply() {

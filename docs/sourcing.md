@@ -123,19 +123,17 @@ and output dimensions.
 
 The image retains three cloud transports. Azure OpenAI chat completions and
 Foundry Messages forward request bodies unchanged through Envoy. Azure Responses is
-explicitly rejected because its echo is the deployment name. The Bedrock Mantle
-candidate is limited to canonical `claude-opus-4-8` in `us-east-1` and requires
-the dedicated `bedrock-mantle-opus48-v2` approved image feature plus registry
-admission of the canonical miner response identity `claude-opus-4-8` under the versioned
-execution-policy contract. The measured adapter validates the raw provider response identity
-before content release and passes it through unchanged. Older images and unadmitted candidates
-remain unavailable. Selecting one per worker does
+explicitly rejected because its echo is the deployment name. Bedrock Mantle accepts models
+from the fixed network-selected registry binding snapshot in `us-east-1` and requires the
+`bedrock-mantle-model-bindings-v1` approved image feature plus the selected row revision.
+The adapter validates the raw provider identity and canonicalizes the response model before
+content release. Older images and unadmitted models remain unavailable. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 
 | Buyer product | Route | Selector |
 |---|---|---|
-| `anthropic/claude-opus-4-8` | AWS Bedrock Mantle | `--anthropic-upstream bedrock` — `us-east-1` only; requires the approved `bedrock-mantle-opus48-v2` image, gateway admission of canonical miner response `claude-opus-4-8`, and miner validation of raw provider identity before content release under the versioned execution-policy contract |
+| `anthropic/*` | AWS Bedrock Mantle | `--anthropic-upstream bedrock` — `us-east-1` only; requires a current fixed-registry model binding, the approved `bedrock-mantle-model-bindings-v1` image, and the binding's row revision on the exact Messages route |
 | `anthropic/*` | Claude on Microsoft Foundry | `--anthropic-upstream foundry` (see [foundry-setup.md](foundry-setup.md)) — qualified measured transport |
 | `openai/*` | Azure OpenAI chat completions | `--openai-upstream azure` — qualified measured transport; `/v1/responses` is rejected |
 

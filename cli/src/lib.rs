@@ -1,6 +1,7 @@
 //! gmcli CLI library — shared types and logic for the CLI binary and tests.
 
 pub mod auth;
+pub mod bedrock_bindings;
 pub mod btcli;
 pub mod chain;
 pub mod client;

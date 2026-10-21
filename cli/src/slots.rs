@@ -116,8 +116,9 @@ fn add_provider_slots(
 ///
 /// A selected qualified cloud upstream contributes exactly one slot for its
 /// provider; the cloud key is single-slot while direct providers retain their
-/// existing semicolon-separated behavior. Bedrock's canonical Opus 4.8 route
-/// uses the Anthropic provider namespace and requires the measured adapter.
+/// existing semicolon-separated behavior. Bedrock model admission comes from
+/// the network-selected registry binding snapshot and uses the Anthropic
+/// provider namespace with the measured adapter.
 ///
 /// # Errors
 /// Returns an error when a cloud-backend key contains `;`, or when any direct

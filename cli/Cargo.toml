@@ -64,6 +64,8 @@ hex          = { workspace = true }
 thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 reqwest      = { workspace = true }
+rustls       = { workspace = true }
+webpki-roots = { workspace = true }
 gm-azure-verify = { workspace = true }
 axoupdater   = { workspace = true }
 chrono       = { version = "0.4", features = ["serde"] }
@@ -92,4 +94,3 @@ mlua         = { version = "0.12", features = ["lua51", "vendored"] }
 chrono       = { version = "0.4", features = ["serde"] }
 rcgen        = "0.14.8"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls       = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }

@@ -27,7 +27,7 @@
 #      event-log replay, TLS-possession proof) before sending chat
 #      requests on it, and renews it every 10 minutes.
 #   6. gm-bedrock-mantle-proxy (when ANTHROPIC_UPSTREAM=bedrock) —
-#      accepts the one qualified Opus 4.8 Messages route on 127.0.0.1:8085
+#      accepts registry-bound Anthropic Messages models on 127.0.0.1:8085
 #      and constructs the fixed Mantle request.
 #   7. envoy — the data plane on :8080. Terminates RA-TLS with the
 #      minted certificate, proxies provider inference traffic and the
@@ -208,7 +208,7 @@ case "${ANTHROPIC_UPSTREAM}" in
     fi
     require_single_slot BEDROCK_API_KEY "${BEDROCK_API_KEY}" "ANTHROPIC_UPSTREAM=bedrock"
     if [[ "${BEDROCK_REGION}" != "us-east-1" ]]; then
-      log "error: Bedrock Mantle Opus 4.8 is qualified only in us-east-1"
+      log "error: Bedrock Mantle Messages is qualified only in us-east-1"
       exit 1
     fi
     # Envoy only reaches the loopback adapter. The adapter pins the Mantle
@@ -453,7 +453,7 @@ fi
 log "benchmark route proxies to https://${BENCHMARK_HOST} (GM_NETWORK=${GM_NETWORK})"
 
 if [[ "${ANTHROPIC_UPSTREAM}" == "bedrock" ]]; then
-  log "anthropic Bedrock Mantle Opus 4.8 adapter uses the fixed us-east-1 endpoint"
+  log "anthropic Bedrock Mantle adapter uses fixed us-east-1 provider and network-selected model bindings"
 fi
 if [[ "${OPENAI_UPSTREAM}" == "azure" ]]; then
   log "openai route proxies to Azure OpenAI at https://${OPENAI_HOST}"

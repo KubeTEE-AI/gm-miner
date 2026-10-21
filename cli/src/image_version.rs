@@ -37,7 +37,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::cloud_policy::REVIEWED_BEDROCK_IMAGE_FEATURE;
+use crate::bedrock_bindings::BEDROCK_MANTLE_IMAGE_FEATURE;
 use crate::deploy::normalize_hash;
 use crate::network::Network;
 
@@ -81,7 +81,7 @@ pub struct AdminImageVersionRequest {
 pub const IMAGE_FEATURES: [&str; 9] = [
     "upstream-key-slots",
     "upstream-model-hop",
-    REVIEWED_BEDROCK_IMAGE_FEATURE,
+    BEDROCK_MANTLE_IMAGE_FEATURE,
     "deepinfra-native-images",
     "chutes-verified-chat",
     "kubetee-attested-chat",
@@ -446,7 +446,7 @@ mod tests {
             serde_json::json!([
                 "upstream-key-slots",
                 "upstream-model-hop",
-                "bedrock-mantle-opus48-v2",
+                BEDROCK_MANTLE_IMAGE_FEATURE,
                 "deepinfra-native-images",
                 "chutes-verified-chat",
                 "kubetee-attested-chat",

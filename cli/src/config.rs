@@ -420,7 +420,7 @@ fn validate_bedrock_region(region: &str) -> Result<()> {
     if region == "us-east-1" {
         Ok(())
     } else {
-        anyhow::bail!("--bedrock-region must be us-east-1 for qualified Bedrock Mantle Opus 4.8")
+        anyhow::bail!("--bedrock-region must be us-east-1 for qualified Bedrock Mantle")
     }
 }
 

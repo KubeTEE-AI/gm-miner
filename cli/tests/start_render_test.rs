@@ -350,6 +350,7 @@ fn azure_responses_is_rejected_with_the_typed_400() {
 fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
     const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
     const EXECUTION_POLICY: &str = "exact-canonical-no-replay-v1";
+    const MODEL_BINDING_REVISION_HEADER: &str = "x-gm-model-binding-revision";
 
     let (status, _, stderr, rendered) = render_envoy([
         ("ANTHROPIC_UPSTREAM", "bedrock"),
@@ -403,7 +404,7 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
             ("x-gm-node-key", "test-node-secret-0001"),
             ("x-gm-upstream-slot", &bedrock_slot),
             (EXECUTION_POLICY_HEADER, EXECUTION_POLICY),
-            ("x-gm-bedrock-mantle-opus48-route", "1"),
+            (MODEL_BINDING_REVISION_HEADER, "17"),
             ("x-envoy-retry-on", "5xx"),
         ],
         &[("GM_ANTHROPIC_KEY_SLOT_1", "bedrock-key")],
@@ -424,10 +425,12 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
             .expect("execution policy"),
         Some(EXECUTION_POLICY.to_owned())
     );
-    assert!(forwarded_headers
-        .get::<Option<String>>("x-gm-bedrock-mantle-opus48-route")
-        .expect("stripped legacy route marker")
-        .is_none());
+    assert_eq!(
+        forwarded_headers
+            .get::<Option<String>>(MODEL_BINDING_REVISION_HEADER)
+            .expect("model-binding revision"),
+        Some("17".to_owned())
+    );
     assert!(forwarded_headers
         .get::<Option<String>>("x-envoy-retry-on")
         .expect("retry header")
@@ -438,6 +441,7 @@ fn bedrock_mantle_routes_through_adapter_with_an_authenticated_slot() {
 fn direct_anthropic_route_strips_the_generic_execution_policy() {
     const EXECUTION_POLICY_HEADER: &str = "x-gm-execution-policy";
     const EXECUTION_POLICY: &str = "exact-canonical-no-replay-v1";
+    const MODEL_BINDING_REVISION_HEADER: &str = "x-gm-model-binding-revision";
     let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "direct-key")]);
     assert!(status.success(), "render failed: {stderr}");
     let direct_slot =
@@ -452,6 +456,7 @@ fn direct_anthropic_route_strips_the_generic_execution_policy() {
             ("x-gm-node-key", "test-node-secret-0001"),
             ("x-gm-upstream-slot", &direct_slot),
             (EXECUTION_POLICY_HEADER, EXECUTION_POLICY),
+            (MODEL_BINDING_REVISION_HEADER, "17"),
         ],
         &[("GM_ANTHROPIC_KEY_SLOT_1", "direct-key")],
     );
@@ -462,6 +467,10 @@ fn direct_anthropic_route_strips_the_generic_execution_policy() {
     assert!(direct_headers
         .get::<Option<String>>(EXECUTION_POLICY_HEADER)
         .expect("stripped direct execution policy")
+        .is_none());
+    assert!(direct_headers
+        .get::<Option<String>>(MODEL_BINDING_REVISION_HEADER)
+        .expect("stripped direct model-binding revision")
         .is_none());
 }
 
@@ -1215,7 +1224,7 @@ fn bedrock_region_validation_rejects_unqualified_region() {
     ]);
     assert!(!status.success(), "bad Bedrock region should fail");
     assert!(
-        stderr.contains("Bedrock Mantle Opus 4.8 is qualified only in us-east-1"),
+        stderr.contains("Bedrock Mantle Messages is qualified only in us-east-1"),
         "unexpected stderr: {stderr}"
     );
 }

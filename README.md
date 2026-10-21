@@ -12,13 +12,12 @@ behind the existing Anthropic/OpenAI routes) and your own funded
 [Phala Cloud](https://cloud.phala.network) account. Transport capability is not registry
 admission: Azure OpenAI chat completions and Foundry Messages are qualified only when the
 image's `upstream-model-hop` feature and the registry's `upstream-model-echo` capability are
-both present. Azure Responses is unqualified because its echo is the deployment name. The
-Bedrock Mantle candidate is limited to `claude-opus-4-8` in `us-east-1`; it requires the
-dedicated approved image feature `bedrock-mantle-opus48-v2` and registry admission of the
-canonical miner response identity `claude-opus-4-8` under the versioned execution-policy
-contract. The measured adapter validates the raw provider response identity before content
-release and passes it through unchanged; it already equals the canonical identity. Older
-images and unadmitted candidates remain unavailable. Direct Anthropic/OpenAI routes use
+both present. Azure Responses is unqualified because its echo is the deployment name.
+Bedrock Mantle accepts models listed in the fixed network-selected registry binding snapshot
+in `us-east-1`; it requires the `bedrock-mantle-model-bindings-v1` approved image feature and
+the selected binding's row revision. The measured adapter validates the raw provider response
+identity, then canonicalizes the response model before releasing content. Older images and
+unadmitted models remain unavailable. Direct Anthropic/OpenAI routes use
 verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
@@ -202,11 +201,10 @@ Cloud registration, recovery and declaration require registry capability
 `upstream-model-echo`; deployment also requires the approved image feature
 `upstream-model-hop`. These contract names are unchanged. The gateway checks each response's
 model echo. Azure Responses still returns a typed JSON 400 because its echo identifies the
-deployment name. The Bedrock Mantle candidate is limited to Opus 4.8 in `us-east-1` and needs
-its dedicated `bedrock-mantle-opus48-v2` approved image feature plus registry
-admission of the canonical miner response identity `claude-opus-4-8` under the versioned
-execution-policy contract. The measured adapter validates the raw provider response identity
-before content release and passes it through unchanged.
+deployment name. Bedrock Mantle uses the fixed network-selected model-binding endpoint in
+`us-east-1` and needs the `bedrock-mantle-model-bindings-v1` approved image feature. The
+gateway supplies the selected binding's row revision; the measured adapter validates the raw
+provider identity and rewrites it to the canonical model before content release.
 Azure OpenAI and Foundry each accept exactly one HMAC slot derived from their single cloud key;
 all other slot ids return 421. Cloud keys cannot contain semicolons.
 
@@ -333,8 +331,9 @@ increase. Older registries continue to accept declarations immediately.
 Use the registry-owned source model for every admitted route; do not override it with a deployment
 name. After the capability check, a cloud offer is declared exactly like its direct
 counterpart; the registry decides whether each worker is eligible. Azure Responses remains
-unqualified. Bedrock offers are limited to the feature-gated Opus 4.8 route above; old AWS
-selector values are not sent by the CLI.
+unqualified. Bedrock offers require a current registry model binding and the feature-gated
+adapter; AWS selector values are read from the fixed registry endpoint and are not accepted
+from miner offers or caller headers.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt

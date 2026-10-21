@@ -109,7 +109,7 @@ COPY --from=builder /build/target/release/gm-chutes-verify-proxy /usr/local/bin/
 COPY --from=builder /build/target/release/gm-kubetee-verify-proxy /usr/local/bin/gm-kubetee-verify-proxy
 
 ## Copy the fixed Bedrock Mantle adapter; start.sh runs it only for the
-## registry-admitted Opus 4.8 backend selection.
+## registry-authorized dynamic model bindings.
 COPY --from=builder /build/target/release/gm-bedrock-mantle-proxy /usr/local/bin/gm-bedrock-mantle-proxy
 
 ## Copy the Envoy config templates; start.sh renders them with gmcli render-envoy.
