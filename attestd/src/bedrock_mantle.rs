@@ -47,6 +47,9 @@ const BEDROCK_BINDINGS_PATH: &str = "/model-bindings/bedrock";
 const MAX_REQUEST_BODY: usize = 20 * 1024 * 1024;
 const MAX_RESPONSE_BODY: usize = 32 * 1024 * 1024;
 const MAX_STREAM_PREAMBLE: usize = 64 * 1024;
+/// One in-body SSE frame. A thinking block's closing signature frame grows with
+/// the thinking (about 75 KB at 32k thinking tokens); 4 MiB leaves wide headroom.
+const MAX_STREAM_FRAME: usize = 4 * 1024 * 1024;
 const MAX_BINDINGS_BODY: usize = 1024 * 1024;
 const MAX_MODEL_BINDINGS: usize = 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
@@ -1339,24 +1342,32 @@ fn guard_stream(source: BoxBodyStream) -> BoxBodyStream {
             match source.next().await {
                 Some(Ok(chunk)) => {
                     total = total.saturating_add(chunk.len());
-                    if total > MAX_RESPONSE_BODY || (terminal && !chunk.is_empty()) {
-                        let error = io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid Bedrock Mantle event stream",
-                        );
+                    let early_end = if total > MAX_RESPONSE_BODY {
+                        Some(StreamEnd::ResponseBodyLimit)
+                    } else if terminal && !chunk.is_empty() {
+                        Some(StreamEnd::DataAfterTerminal)
+                    } else {
+                        None
+                    };
+                    if let Some(end) = early_end {
                         return Some((
-                            Err(error),
+                            Err(end.into_error()),
                             (source, pending, total, started, terminal, true),
                         ));
                     }
+                    // `pending` holds no separator yet, so scan only the new
+                    // bytes (less a separator's overlap): a frame near the bound
+                    // must not be rescanned on every chunk.
+                    let scanned = pending.len().saturating_sub(3);
                     pending.extend_from_slice(&chunk);
                     let mut consumed = 0usize;
                     while let Some((frame_end, separator_end)) =
-                        find_sse_frame(&pending[consumed..])
+                        find_sse_frame(&pending[consumed.max(scanned)..])
                     {
+                        let base = consumed.max(scanned);
                         let start = consumed;
-                        let frame_end = consumed + frame_end;
-                        let after_frame = consumed + separator_end;
+                        let frame_end = base + frame_end;
+                        let after_frame = base + separator_end;
                         match parse_stream_event(&pending[start..frame_end]) {
                             Ok(StreamEvent::Empty | StreamEvent::Ping) if !terminal => {}
                             Ok(StreamEvent::MessageStart) if !started && !terminal => {
@@ -1369,35 +1380,23 @@ fn guard_stream(source: BoxBodyStream) -> BoxBodyStream {
                             }
                             Ok(StreamEvent::Other) if started && !terminal => {}
                             _ => {
-                                let error = io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid Bedrock Mantle event stream",
-                                );
                                 return Some((
-                                    Err(error),
+                                    Err(StreamEnd::InvalidEvent.into_error()),
                                     (source, pending, total, started, terminal, true),
                                 ));
                             }
                         }
                         consumed = after_frame;
                         if terminal && consumed < pending.len() {
-                            let error = io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "data follows terminal Bedrock Mantle event",
-                            );
                             return Some((
-                                Err(error),
+                                Err(StreamEnd::DataAfterTerminal.into_error()),
                                 (source, pending, total, started, terminal, true),
                             ));
                         }
                     }
-                    if pending.len().saturating_sub(consumed) > MAX_STREAM_PREAMBLE {
-                        let error = io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "oversized Bedrock Mantle event frame",
-                        );
+                    if pending.len().saturating_sub(consumed) > MAX_STREAM_FRAME {
                         return Some((
-                            Err(error),
+                            Err(StreamEnd::FrameLimit.into_error()),
                             (source, pending, total, started, terminal, true),
                         ));
                     }
@@ -1409,25 +1408,71 @@ fn guard_stream(source: BoxBodyStream) -> BoxBodyStream {
                         (source, pending, total, started, terminal, false),
                     ))
                 }
-                Some(Err(error)) => Some((
-                    Err(error),
+                Some(Err(_)) => Some((
+                    Err(StreamEnd::UpstreamInterrupted.into_error()),
                     (source, pending, total, started, terminal, true),
                 )),
                 None if terminal && pending.is_empty() => None,
-                None => {
-                    let error = io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Bedrock Mantle event stream ended without a terminal event",
-                    );
-                    Some((
-                        Err(error),
-                        (source, pending, total, started, terminal, true),
-                    ))
-                }
+                None => Some((
+                    Err(StreamEnd::MissingTerminal.into_error()),
+                    (source, pending, total, started, terminal, true),
+                )),
             }
         },
     );
     guarded.boxed()
+}
+
+/// Why [`guard_stream`] ended a response body early. Logged by name only:
+/// no event bytes or sizes from the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    ResponseBodyLimit,
+    DataAfterTerminal,
+    InvalidEvent,
+    FrameLimit,
+    MissingTerminal,
+    UpstreamInterrupted,
+}
+
+impl StreamEnd {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ResponseBodyLimit => "response_body_limit",
+            Self::DataAfterTerminal => "data_after_terminal",
+            Self::InvalidEvent => "invalid_event",
+            Self::FrameLimit => "frame_limit",
+            Self::MissingTerminal => "missing_terminal",
+            Self::UpstreamInterrupted => "upstream_interrupted",
+        }
+    }
+
+    fn into_error(self) -> io::Error {
+        tracing::warn!(reason = self.reason(), "Bedrock Mantle stream ended early");
+        let (kind, message) = match self {
+            Self::ResponseBodyLimit | Self::InvalidEvent => (
+                io::ErrorKind::InvalidData,
+                "invalid Bedrock Mantle event stream",
+            ),
+            Self::DataAfterTerminal => (
+                io::ErrorKind::InvalidData,
+                "data follows terminal Bedrock Mantle event",
+            ),
+            Self::FrameLimit => (
+                io::ErrorKind::InvalidData,
+                "oversized Bedrock Mantle event frame",
+            ),
+            Self::MissingTerminal => (
+                io::ErrorKind::UnexpectedEof,
+                "Bedrock Mantle event stream ended without a terminal event",
+            ),
+            Self::UpstreamInterrupted => (
+                io::ErrorKind::ConnectionReset,
+                "upstream stream interrupted",
+            ),
+        };
+        io::Error::new(kind, message)
+    }
 }
 
 enum StreamEvent {
@@ -2220,6 +2265,252 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    fn signature_delta_frame(signature_bytes: usize) -> Vec<u8> {
+        let mut frame = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"".to_vec();
+        frame.resize(frame.len() + signature_bytes, b'A');
+        frame.extend_from_slice(b"\"}}\n\n");
+        frame
+    }
+
+    fn stream_with_frame(frame: &[u8]) -> Vec<u8> {
+        let mut body = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a\"}}\n\n".to_vec();
+        body.extend_from_slice(frame);
+        body.extend_from_slice(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        body
+    }
+
+    fn in_chunks(body: &[u8], chunk_bytes: usize) -> BoxBodyStream {
+        let chunks: Vec<Result<Bytes, io::Error>> = body
+            .chunks(chunk_bytes)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        stream::iter(chunks).boxed()
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_passes_a_signature_frame_larger_than_the_preamble_bound() {
+        // A long thinking block ends in one signature frame; at 32k thinking
+        // tokens it is about 75 KB, so it arrives split across many reads.
+        let body = stream_with_frame(&signature_delta_frame(MAX_STREAM_PREAMBLE + 32 * 1024));
+        let collected = guard_stream(in_chunks(&body, 8 * 1024))
+            .collect::<Vec<_>>()
+            .await;
+        let mut forwarded = Vec::new();
+        for chunk in collected {
+            forwarded.extend_from_slice(&chunk.expect("large frame must pass"));
+        }
+        assert_eq!(forwarded, body);
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_finds_separators_split_across_any_chunk_boundary() {
+        // Mixed LF and CRLF separators, so each lands across a boundary at
+        // some chunk size; a frame left unparsed would end the stream early.
+        let body = concat!(
+            "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a\"}}\r\n\r\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\"}\r\n\r\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        )
+        .as_bytes();
+        for chunk_bytes in 1..=7 {
+            let mut forwarded = Vec::new();
+            for chunk in guard_stream(in_chunks(body, chunk_bytes))
+                .collect::<Vec<_>>()
+                .await
+            {
+                forwarded.extend_from_slice(&chunk.expect("valid stream must pass"));
+            }
+            assert_eq!(forwarded, body, "chunk size {chunk_bytes}");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_holds_exactly_the_frame_bound_of_a_partial_frame() {
+        let body = stream_with_frame(&signature_delta_frame(MAX_STREAM_FRAME));
+        let frame_start = body
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .expect("message_start separator")
+            + 2;
+        let at_bound = frame_start + MAX_STREAM_FRAME;
+        for (split, passes) in [(at_bound, true), (at_bound + 1, false)] {
+            let chunks = stream::iter([
+                Ok(Bytes::copy_from_slice(&body[..split])),
+                Ok(Bytes::copy_from_slice(&body[split..])),
+            ])
+            .boxed();
+            let collected = guard_stream(chunks).collect::<Vec<_>>().await;
+            assert_eq!(
+                collected.iter().all(Result::is_ok),
+                passes,
+                "{} buffered bytes",
+                split - frame_start
+            );
+        }
+    }
+
+    fn padded_ping(frame_bytes: usize) -> Vec<u8> {
+        let mut frame = b"event: ping\ndata: {\"type\":\"ping\",\"pad\":\"".to_vec();
+        let closing = b"\"}\n\n";
+        frame.resize(frame_bytes - closing.len(), b'A');
+        frame.extend_from_slice(closing);
+        frame
+    }
+
+    /// A valid stream of exactly `total` bytes, padded with ping frames.
+    fn stream_of_length(total: usize) -> Vec<u8> {
+        let mut padding = Vec::new();
+        let mut remaining = total - stream_with_frame(&[]).len();
+        while remaining > 0 {
+            let frame = remaining.min(1024 * 1024);
+            let frame = if remaining - frame < 64 {
+                remaining
+            } else {
+                frame
+            };
+            padding.extend(padded_ping(frame));
+            remaining -= frame;
+        }
+        stream_with_frame(&padding)
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_holds_exactly_the_response_body_bound() {
+        for (total, passes) in [(MAX_RESPONSE_BODY, true), (MAX_RESPONSE_BODY + 1, false)] {
+            let body = stream_of_length(total);
+            assert_eq!(body.len(), total);
+            let collected = guard_stream(in_chunks(&body, 1024 * 1024))
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(collected.iter().all(Result::is_ok), passes, "{total} bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_enforces_event_order() {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a\"}}\n\n";
+        let delta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n";
+        let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        for (body, valid) in [
+            (format!("{start}{delta}{stop}"), true),
+            (format!("{start}{start}{stop}"), false),
+            (format!("{delta}{start}{stop}"), false),
+            (stop.to_owned(), false),
+        ] {
+            let chunks = stream::iter([Ok(Bytes::from(body.clone()))]).boxed();
+            let collected = guard_stream(chunks).collect::<Vec<_>>().await;
+            assert_eq!(collected.iter().all(Result::is_ok), valid, "{body}");
+        }
+        let after_stop =
+            stream::iter([Ok(Bytes::from(format!("{start}{stop}"))), Ok(Bytes::new())]).boxed();
+        assert!(guard_stream(after_stop)
+            .collect::<Vec<_>>()
+            .await
+            .iter()
+            .all(Result::is_ok));
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_rejects_a_frame_over_the_frame_bound() {
+        // Exceed the bound by more than a chunk, so the partial frame crosses
+        // it before the frame can complete.
+        let body = stream_with_frame(&signature_delta_frame(MAX_STREAM_FRAME + 16 * 1024));
+        let collected = guard_stream(in_chunks(&body, 8 * 1024))
+            .collect::<Vec<_>>()
+            .await;
+        let error = collected
+            .last()
+            .expect("stream output")
+            .as_ref()
+            .expect_err("an oversized frame must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(collected.iter().filter(|chunk| chunk.is_err()).count(), 1);
+    }
+
+    thread_local! {
+        static THREAD_LOG: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Writes into the calling thread's buffer. A `#[tokio::test]` runs on
+    /// its own thread, so each test reads only what it logged.
+    struct ThreadLog;
+
+    impl io::Write for ThreadLog {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            THREAD_LOG.with(|log| log.borrow_mut().extend_from_slice(bytes));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A process-wide subscriber: a scoped default races callsite interest
+    /// caching against parallel tests that log under no subscriber.
+    fn install_thread_log() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLog)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in this test binary");
+        });
+    }
+
+    async fn guard_log(body: &[u8]) -> String {
+        install_thread_log();
+        THREAD_LOG.with(|log| log.borrow_mut().clear());
+        let _ = guard_stream(in_chunks(body, 8 * 1024))
+            .collect::<Vec<_>>()
+            .await;
+        let bytes = THREAD_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()));
+        String::from_utf8(bytes).expect("UTF-8 log")
+    }
+
+    #[tokio::test]
+    async fn guarded_stream_logs_the_rule_that_ended_it_without_content() {
+        let oversized = stream_with_frame(&signature_delta_frame(MAX_STREAM_FRAME + 16 * 1024));
+        let log = guard_log(&oversized).await;
+        assert!(log.contains("reason=\"frame_limit\""), "log: {log}");
+        assert!(!log.contains("AAAA"), "log carries stream bytes: {log}");
+
+        let unknown = stream_with_frame(b"event: unknown\ndata: {\"type\":\"unknown\"}\n\n");
+        let log = guard_log(&unknown).await;
+        assert!(log.contains("reason=\"invalid_event\""), "log: {log}");
+        assert!(!log.contains("unknown"), "log carries stream bytes: {log}");
+
+        let mut after_terminal = stream_with_frame(&[]);
+        after_terminal.extend_from_slice(b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
+        let log = guard_log(&after_terminal).await;
+        assert!(log.contains("reason=\"data_after_terminal\""), "log: {log}");
+
+        let valid = stream_with_frame(&signature_delta_frame(16));
+        assert_eq!(guard_log(&valid).await, "");
+    }
+
+    #[tokio::test]
+    async fn stream_identity_rejects_a_preamble_over_its_bound() {
+        let mut ping = b"event: ping\ndata: {\"type\":\"ping\",\"pad\":\"".to_vec();
+        ping.resize(ping.len() + MAX_STREAM_PREAMBLE, b'A');
+        ping.extend_from_slice(b"\"}\n\n");
+        let body = stream_with_frame(&[]);
+        let mut oversized = ping;
+        oversized.extend_from_slice(&body);
+        assert!(matches!(
+            validate_stream_identity(
+                in_chunks(&oversized, 8 * 1024),
+                TEST_RESPONSE_MODEL_A,
+                TEST_MODEL_A
+            )
+            .await,
+            Err(Reject::Upstream)
+        ));
     }
 
     #[tokio::test]
