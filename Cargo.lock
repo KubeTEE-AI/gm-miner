@@ -2876,6 +2876,7 @@ name = "gm-azure-verify"
 version = "0.5.10"
 dependencies = [
  "anyhow",
+ "hyper",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
