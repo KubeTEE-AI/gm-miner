@@ -76,10 +76,33 @@ RUN touch cli/src/main.rs attestd/src/main.rs attestd/src/lib.rs \
 ## Pin the base by digest so a mutable tag cannot change the attested runtime.
 FROM envoyproxy/envoy:v1.38-latest@sha256:4e3c734cbe9892a3513c97cf3974ff73cfef5d784f5cceed9ea758a2b80e0c31
 
-## ca-certificates is already present in the envoy base image; nothing
-## else needs to be installed — the attestation server talks to the
-## dstack guest agent over a unix socket and is reached by envoy over
-## loopback, so no extra runtime packages are required.
+## Every Envoy upstream cluster validates against the system bundle
+## /etc/ssl/certs/ca-certificates.crt. The base image ships
+## ca-certificates 20240203~22.04.1; pin the jammy-security release that
+## carries Mozilla's 2.90 root store. Its postinst drops the roots that
+## release removed, including AAA Certificate Services and emSign ECC
+## Root CA - G3. The check after it fails the build if either root is
+## still in the bundle Envoy reads, by SHA-256 fingerprint (AAA
+## Certificate Services D7:A7:A0:FB..., emSign ECC Root CA - G3
+## 86:A1:EC:BA...), whatever a later package does.
+## Nothing else needs to be installed — the attestation server talks to
+## the dstack guest agent over a unix socket and is reached by envoy
+## over loopback.
+## Update the pin via: apt-cache policy ca-certificates (in this base image)
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates=20260816ubuntu0.22.04.1 \
+  && rm -rf /var/lib/apt/lists/* \
+  && bundle=/etc/ssl/certs/ca-certificates.crt \
+  && awk -v fp='openssl x509 -noout -fingerprint -sha256' \
+    '/BEGIN CERT/ { pem = "" } { pem = pem $0 "\n" } /END CERT/ { printf "%s", pem | fp; close(fp) }' \
+    "${bundle}" > /tmp/ca-fingerprints \
+  && test "$(wc -l < /tmp/ca-fingerprints)" -eq "$(grep -c 'BEGIN CERT' "${bundle}")" \
+  && ! grep -i \
+    -e 'D7:A7:A0:FB:5D:7E:27:31:D7:71:E9:48:4E:BC:DE:F7:1D:5F:0C:3E:0A:29:48:78:2B:C8:3E:E0:EA:69:9E:F4' \
+    -e '86:A1:EC:BA:08:9C:4A:8D:3B:BE:27:34:C6:12:BA:34:1D:81:3E:04:3C:F9:E8:A8:62:CD:5C:57:A3:6B:BE:6B' \
+    /tmp/ca-fingerprints \
+  && rm /tmp/ca-fingerprints
 
 ## Image version — set at build time by the build pipeline.
 ARG GM_IMAGE_VERSION=dev
