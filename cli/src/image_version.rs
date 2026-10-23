@@ -78,7 +78,12 @@ pub struct AdminImageVersionRequest {
 
 /// Features this release's image supports. Stamped verbatim onto every
 /// published whitelist row.
-pub const IMAGE_FEATURES: [&str; 9] = [
+///
+/// `container-allowlist` opts workers on this image into the registry's
+/// container check, which reads the CVM's public guest-agent page. It is a
+/// registry feature, unrelated to the `app_compose` `features` that
+/// [`crate::compose_hash`] measures.
+pub const IMAGE_FEATURES: [&str; 10] = [
     "upstream-key-slots",
     "upstream-model-hop",
     BEDROCK_MANTLE_IMAGE_FEATURE,
@@ -88,6 +93,7 @@ pub const IMAGE_FEATURES: [&str; 9] = [
     "kubetee-no-retry-images",
     "video-jobs-v1",
     "engy-video-v2",
+    "container-allowlist",
 ];
 
 /// The git provenance stamped onto a published version.
@@ -452,7 +458,8 @@ mod tests {
                 "kubetee-attested-chat",
                 "kubetee-no-retry-images",
                 "video-jobs-v1",
-                "engy-video-v2"
+                "engy-video-v2",
+                "container-allowlist"
             ]),
         );
     }
