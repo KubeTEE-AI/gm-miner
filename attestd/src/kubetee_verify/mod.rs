@@ -8,6 +8,7 @@
 //! signing the nonce. Chat requests are then sent on attested connections
 //! only, one at a time per connection.
 
+pub mod binding;
 pub mod evidence;
 pub mod pool;
 

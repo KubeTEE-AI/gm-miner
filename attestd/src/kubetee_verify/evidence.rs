@@ -8,16 +8,16 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use dcap_qvl::policy::QuoteClaims;
 use dcap_qvl::quote::TDReport10;
-use serde_json::Value;
-use sha2::{Digest as _, Sha256, Sha512};
 use ring::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256, Sha512};
 use tracing::info;
 use x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION;
 use x509_parser::parse_x509_certificate;
 
 use crate::eventlog::{self, Register};
+use crate::kubetee_verify::binding;
 use crate::tee_evidence;
 
 const SIGNATURE_ALGORITHM: &str = "RS256";
@@ -74,15 +74,16 @@ impl BindingGuard {
     /// Returns an error when the response is v1-shaped and the statement,
     /// keyset, or version check fails.
     pub(crate) fn run(body: &[u8], nonce: &str, leaf: &[u8]) -> Result<Option<[u8; 64]>> {
-        let payload: Value = serde_json::from_slice(body).context("decode KubeTEE attestation response")?;
-        let keyset = payload.get("keyset");
-        let bindings = payload.get("bindings");
-        match (keyset, bindings) {
-            (Some(keyset), Some(bindings)) => {
+        let payload: Value =
+            serde_json::from_slice(body).context("decode KubeTEE attestation response")?;
+        let keyset_present = payload.get("keyset").is_some();
+        let bindings_present = payload.get("bindings").is_some();
+        match (keyset_present, bindings_present) {
+            (true, true) => {
                 let fields: BindingFields = serde_json::from_slice(body)
                     .context("decode kubetee.attestation.v1 binding fields")?;
                 ensure!(
-                    fields.bindings.version == crate::kubetee_verify::binding::PURPOSE,
+                    fields.bindings.version == binding::PURPOSE,
                     "kubetee.attestation.v1 binding has version {}, expected {}",
                     fields.bindings.version,
                     binding::PURPOSE
@@ -95,16 +96,16 @@ impl BindingGuard {
                 )?;
                 Ok(Some(report_data))
             }
-            (None, None) => Ok(None),
+            (false, false) => Ok(None),
             _ => bail!("KubeTEE attestation response has half a v1 binding"),
         }
     }
 
     fn verify_served_keyset(keyset: &Value, stated_digest: &str, leaf: &[u8]) -> Result<()> {
-        let (_, certificate) =
-            parse_x509_certificate(leaf).map_err(|error| anyhow!("parse KubeTEE TLS certificate: {error}"))?;
+        let (_, certificate) = parse_x509_certificate(leaf)
+            .map_err(|error| anyhow!("parse KubeTEE TLS certificate: {error}"))?;
         let spki = certificate.public_key().raw;
-        let recomputed = binding::keyset_digest_of(spki, keyset)?;
+        let recomputed = binding::recompute_keyset_digest(keyset)?;
         ensure!(
             recomputed == stated_digest,
             "kubetee.attestation.v1 keyset digest does not match the served keyset"
@@ -116,7 +117,8 @@ impl BindingGuard {
             .is_some_and(|keys| {
                 keys.iter().any(|key| {
                     key.get("domain").and_then(Value::as_str) == Some(HOST_DOMAIN)
-                        && key.get("spki_sha256").and_then(Value::as_str) == Some(spki_sha256.as_str())
+                        && key.get("spki_sha256").and_then(Value::as_str)
+                            == Some(spki_sha256.as_str())
                 })
             });
         ensure!(
@@ -130,7 +132,10 @@ impl BindingGuard {
         let expires = DateTime::parse_from_rfc3339(not_after)
             .context("kubetee.attestation.v1 keyset not_after is not RFC 3339")?
             .with_timezone(&Utc);
-        ensure!(expires > Utc::now(), "kubetee.attestation.v1 keyset is expired");
+        ensure!(
+            expires > Utc::now(),
+            "kubetee.attestation.v1 keyset is expired"
+        );
         Ok(())
     }
 }
@@ -176,6 +181,14 @@ pub fn verify_attestation(
     verify_attestation_bound(payload, nonce, leaf, claims, now, None)
 }
 
+/// `verify_attestation` with the binding a v1 response already proved:
+/// `Some(report_data)` from the served statement, `None` for the legacy
+/// `SHA-512(nonce)` construction.
+///
+/// # Errors
+///
+/// Returns an error naming the first check that fails, as
+/// [`verify_attestation`] does.
 pub fn verify_attestation_bound(
     payload: &AttestationPayload,
     nonce: &str,
@@ -202,10 +215,6 @@ pub fn verify_attestation_bound(
         .context("KubeTEE attestation has no tls_possession")?;
     verify_tls_possession(possession, nonce, leaf)?;
     Ok(measurements)
-}
-
-fn verify_report_data(td: &TDReport10, nonce: &str) -> Result<()> {
-    verify_report_data_bound(td, nonce, None)
 }
 
 fn verify_report_data_bound(td: &TDReport10, nonce: &str, bound: Option<[u8; 64]>) -> Result<()> {
@@ -288,14 +297,20 @@ mod tests {
         "sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d";
     const FIXTURE_STATEMENT: &str = r#"{"keyset_digest":"sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d","nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","purpose":"kubetee.attestation.v1"}"#;
 
-    fn fixture_keyset() -> Value {
+    const SPKI_SHA256: &str = "3f728244ad1bb95542b14cdbf7f637105dc588f8958c862e4beffc450c000cd3";
+
+    fn v1_keyset(not_after: &str, spki: &str) -> Value {
         serde_json::json!({
             "subject": "kubetee.attestation.v1/llm.kubetee.ai",
-            "not_after": "2030-01-01T00:00:00Z",
-            "tls_public_keys": [{"domain": "llm.kubetee.ai", "spki_sha256": "3f728244ad1bb95542b14cdbf7f637105dc588f8958c862e4beffc450c000cd3"}],
+            "not_after": not_after,
+            "tls_public_keys": [{"domain": "llm.kubetee.ai", "spki_sha256": spki}],
             "signing_keys": [],
             "e2ee_keys": []
         })
+    }
+
+    fn statement(digest: &str, nonce: &str) -> String {
+        format!("{{\"keyset_digest\":\"{digest}\",\"nonce\":\"{nonce}\",\"purpose\":\"kubetee.attestation.v1\"}}")
     }
 
     fn fixture_body(keyset: &Value, statement: &str, digest: &str) -> Vec<u8> {
@@ -307,35 +322,47 @@ mod tests {
         .unwrap()
     }
 
+    fn self_consistent_body(not_after: &str, spki: &str) -> Vec<u8> {
+        let keyset = v1_keyset(not_after, spki);
+        let digest = binding::recompute_keyset_digest(&keyset).unwrap();
+        let stmt = statement(&digest, FIXTURE_NONCE);
+        fixture_body(&keyset, &stmt, &digest)
+    }
+
     #[test]
     fn a_v1_response_binds_the_serving_key() {
-        let body = fixture_body(&fixture_keyset(), FIXTURE_STATEMENT, FIXTURE_KEYSET_DIGEST);
-        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF).unwrap().unwrap();
-        assert_eq!(hex::encode(bound[..32]), hex::encode(Sha256::digest(FIXTURE_STATEMENT.as_bytes())));
+        let keyset = v1_keyset("2099-01-01T00:00:00Z", SPKI_SHA256);
+        let digest = binding::recompute_keyset_digest(&keyset).unwrap();
+        let stmt = statement(&digest, FIXTURE_NONCE);
+        let body = fixture_body(&keyset, &stmt, &digest);
+        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bound,
+            binding::report_data_of_statement(&stmt, &digest, FIXTURE_NONCE).unwrap()
+        );
         assert_eq!(bound[32..], [0; 32]);
     }
 
     #[test]
     fn a_legacy_response_binds_the_legacy_construction() {
         let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","quote":"","report_data_input":"sha512(nonce)"}"#;
-        assert!(BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF).unwrap().is_none());
-    }
+        assert!(BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn a_v1_keyset_for_another_serving_key_fails_closed() {
-        let mut keyset = fixture_keyset();
-        keyset["tls_public_keys"][0]["spki_sha256"] = serde_json::json!("0".repeat(64));
-        let body = fixture_body(&keyset, FIXTURE_STATEMENT, FIXTURE_KEYSET_DIGEST);
+        let body = self_consistent_body("2099-01-01T00:00:00Z", &"0".repeat(64));
         let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF).unwrap_err();
-        assert!(format!("{error:#}").contains("keyset digest"));
+        assert!(format!("{error:#}").contains("serving key"));
     }
 
     #[test]
     fn a_v1_keyset_expired_fails_closed() {
-        let mut keyset = fixture_keyset();
-        keyset["not_after"] = serde_json::json!("2000-01-01T00:00:00Z");
-        let body = fixture_body(&keyset, FIXTURE_STATEMENT, FIXTURE_KEYSET_DIGEST);
+        let body = self_consistent_body("2000-01-01T00:00:00Z", SPKI_SHA256);
         let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF).unwrap_err();
         assert!(format!("{error:#}").contains("expired"));
     }
@@ -349,8 +376,12 @@ mod tests {
 
     #[test]
     fn the_statement_binding_matches_the_python_builder() {
-        let bound = binding::report_data_of_statement(FIXTURE_STATEMENT, FIXTURE_KEYSET_DIGEST, FIXTURE_NONCE)
-            .unwrap();
+        let bound = binding::report_data_of_statement(
+            FIXTURE_STATEMENT,
+            FIXTURE_KEYSET_DIGEST,
+            FIXTURE_NONCE,
+        )
+        .unwrap();
         assert_eq!(
             hex::encode(bound),
             "9e4867826f437965258b4bcf964e603e30d31b662a4f3ef0ffc50cba611633710000000000000000000000000000000000000000000000000000000000000000"
