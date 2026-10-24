@@ -8,19 +8,27 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use dcap_qvl::policy::QuoteClaims;
 use dcap_qvl::quote::TDReport10;
-use ring::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
+use ring::signature::{
+    UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_FIXED, RSA_PKCS1_2048_8192_SHA256,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256, Sha512};
 use tracing::info;
-use x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION;
+use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_PKCS1_RSAENCRYPTION};
 use x509_parser::parse_x509_certificate;
 
 use crate::eventlog::{self, Register};
 use crate::kubetee_verify::binding;
 use crate::tee_evidence;
 
-const SIGNATURE_ALGORITHM: &str = "RS256";
+/// The signature algorithms a TLS-possession proof may name: `ES256` (ECDSA
+/// over SHA-256 on P-256 — the per-boot serving key) and `RS256` (RSASSA-
+/// PKCS1-v1_5 over SHA-256 — a legacy RSA key). The proof is accepted in
+/// the encoding the named algorithm implies and fails closed on any other
+/// spelling or on a key-type mismatch.
+const ES256: &str = "ES256";
+const RS256: &str = "RS256";
 
 /// The `GET /v1/attestation` response body.
 #[derive(Debug, Deserialize)]
@@ -239,13 +247,13 @@ fn verify_event_log(log: &str, quoted: &[Register; 4]) -> Result<()> {
 }
 
 /// Check that the TLS-possession proof names this connection's leaf
-/// certificate and that its key signed `nonce` (RSASSA-PKCS1-v1_5, SHA-256).
+/// certificate and that its key signed `nonce`. The proof names its
+/// algorithm (`tls_signature_alg`): `ES256` is ECDSA over SHA-256 with the
+/// certificate's P-256 key — raw `r||s` (64 bytes) or ASN.1 DER, both
+/// accepted — and `RS256` is RSASSA-PKCS1-v1_5 over SHA-256 with its RSA
+/// key. Any other algorithm, or one that does not match the certificate's
+/// key type, fails closed.
 fn verify_tls_possession(possession: &TlsPossession, nonce: &str, leaf: &[u8]) -> Result<()> {
-    ensure!(
-        possession.tls_signature_alg == SIGNATURE_ALGORITHM,
-        "KubeTEE TLS-possession signature is {}, expected {SIGNATURE_ALGORITHM}",
-        possession.tls_signature_alg
-    );
     let claimed = hex::decode(&possession.tls_cert_sha256)
         .context("decode KubeTEE TLS certificate fingerprint")?;
     ensure!(
@@ -255,16 +263,49 @@ fn verify_tls_possession(possession: &TlsPossession, nonce: &str, leaf: &[u8]) -
     let (_, certificate) = parse_x509_certificate(leaf)
         .map_err(|error| anyhow!("parse KubeTEE TLS certificate: {error}"))?;
     let key = certificate.public_key();
-    ensure!(
-        key.algorithm.algorithm == OID_PKCS1_RSAENCRYPTION,
-        "KubeTEE TLS certificate key is not RSA"
-    );
     let signature = STANDARD
         .decode(&possession.tls_signature)
         .context("decode KubeTEE TLS-possession signature")?;
-    UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &key.subject_public_key.data)
-        .verify(nonce.as_bytes(), &signature)
-        .map_err(|_| anyhow!("KubeTEE TLS-possession signature does not verify"))
+    match possession.tls_signature_alg.as_str() {
+        RS256 => {
+            ensure!(
+                key.algorithm.algorithm == OID_PKCS1_RSAENCRYPTION,
+                "KubeTEE TLS-possession signature is RS256 but the certificate key is not RSA"
+            );
+            UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &key.subject_public_key.data)
+                .verify(nonce.as_bytes(), &signature)
+                .map_err(|_| anyhow!("KubeTEE TLS-possession signature does not verify"))
+        }
+        ES256 => {
+            ensure!(
+                key.algorithm.algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY
+                    && key
+                        .algorithm
+                        .parameters
+                        .as_ref()
+                        .and_then(|params| params.as_oid().ok())
+                        .is_some_and(|curve| curve == OID_EC_P256),
+                "KubeTEE TLS-possession signature is ES256 but the certificate key is not P-256"
+            );
+            // A 64-byte signature is the raw r||s encoding (JOSE style, what
+            // KubeTEE's per-boot signer emits); anything else is DER.
+            let algorithms: &[&dyn ring::signature::VerificationAlgorithm] =
+                if signature.len() == 64 {
+                    &[&ECDSA_P256_SHA256_FIXED]
+                } else {
+                    &[&ECDSA_P256_SHA256_ASN1]
+                };
+            algorithms
+                .iter()
+                .find_map(|algorithm| {
+                    UnparsedPublicKey::new(*algorithm, &key.subject_public_key.data)
+                        .verify(nonce.as_bytes(), &signature)
+                        .ok()
+                })
+                .ok_or_else(|| anyhow!("KubeTEE TLS-possession signature does not verify"))
+        }
+        other => bail!("KubeTEE TLS-possession signature is {other}, expected {ES256} or {RS256}"),
+    }
 }
 
 /// Log the replica and measured registers of a newly attested connection.
@@ -289,9 +330,18 @@ mod tests {
         reason = "test fixtures intentionally fail hard on malformed local values"
     )]
 
+    use ring::rand::SystemRandom;
+    use ring::signature::{
+        EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_FIXED_SIGNING,
+    };
+
     use super::*;
 
     const SESSION_LEAF: &[u8] = include_bytes!("../../tests/fixtures/kubetee/session_leaf.der");
+    const EC_SESSION_LEAF: &[u8] =
+        include_bytes!("../../tests/fixtures/kubetee/ec_session_leaf.der");
+    const EC_SESSION_KEY: &[u8] =
+        include_bytes!("../../tests/fixtures/kubetee/ec_session_leaf_key.pk8");
     const FIXTURE_NONCE: &str = "cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a";
     const FIXTURE_KEYSET_DIGEST: &str =
         "sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d";
@@ -386,5 +436,69 @@ mod tests {
             hex::encode(bound),
             "9e4867826f437965258b4bcf964e603e30d31b662a4f3ef0ffc50cba611633710000000000000000000000000000000000000000000000000000000000000000"
         );
+    }
+
+    /// An `ES256` possession proof over the per-boot P-256 key, as
+    /// `kubetee_attestation.py` emits it (raw `r||s`) and in the DER
+    /// encoding a TLS stack would produce. Both must verify.
+    #[test]
+    fn an_es256_proof_verifies_in_both_encodings() {
+        let rng = SystemRandom::new();
+        for algorithm in [
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+        ] {
+            let key = EcdsaKeyPair::from_pkcs8(algorithm, EC_SESSION_KEY, &rng).unwrap();
+            let signature = key.sign(&rng, FIXTURE_NONCE.as_bytes()).unwrap();
+            let possession = TlsPossession {
+                tls_signature: STANDARD.encode(signature.as_ref()),
+                tls_signature_alg: ES256.to_owned(),
+                tls_cert_sha256: hex::encode(Sha256::digest(EC_SESSION_LEAF)),
+            };
+            verify_tls_possession(&possession, FIXTURE_NONCE, EC_SESSION_LEAF).unwrap();
+        }
+    }
+
+    /// A proof signed by some other P-256 key does not verify against the
+    /// certificate it names.
+    #[test]
+    fn an_es256_proof_from_another_key_fails_closed() {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let signature = key.sign(&rng, FIXTURE_NONCE.as_bytes()).unwrap();
+        let possession = TlsPossession {
+            tls_signature: STANDARD.encode(signature.as_ref()),
+            tls_signature_alg: ES256.to_owned(),
+            tls_cert_sha256: hex::encode(Sha256::digest(EC_SESSION_LEAF)),
+        };
+        let error = verify_tls_possession(&possession, FIXTURE_NONCE, EC_SESSION_LEAF).unwrap_err();
+        assert!(format!("{error:#}").contains("does not verify"));
+    }
+
+    /// `ES256` claimed over an RSA certificate key fails closed on the
+    /// key type, before any signature check.
+    #[test]
+    fn an_es256_claim_over_an_rsa_leaf_fails_closed() {
+        let possession = TlsPossession {
+            tls_signature: STANDARD.encode([0_u8; 64]),
+            tls_signature_alg: ES256.to_owned(),
+            tls_cert_sha256: hex::encode(Sha256::digest(SESSION_LEAF)),
+        };
+        let error = verify_tls_possession(&possession, FIXTURE_NONCE, SESSION_LEAF).unwrap_err();
+        assert!(format!("{error:#}").contains("not P-256"));
+    }
+
+    /// An algorithm outside the accepted pair fails closed.
+    #[test]
+    fn an_unnamed_signature_algorithm_fails_closed() {
+        let possession = TlsPossession {
+            tls_signature: STANDARD.encode([0_u8; 64]),
+            tls_signature_alg: "PS256".to_owned(),
+            tls_cert_sha256: hex::encode(Sha256::digest(EC_SESSION_LEAF)),
+        };
+        let error = verify_tls_possession(&possession, FIXTURE_NONCE, EC_SESSION_LEAF).unwrap_err();
+        assert!(format!("{error:#}").contains("expected ES256 or RS256"));
     }
 }
