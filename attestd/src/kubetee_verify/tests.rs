@@ -198,10 +198,18 @@ fn a_bad_tls_signature_fails_closed() {
 }
 
 #[test]
-fn a_non_rs256_proof_fails_closed() {
+fn an_unnamed_signature_algorithm_fails_closed() {
+    let mut payload = payload();
+    payload.tls_possession.as_mut().unwrap().tls_signature_alg = "PS256".to_owned();
+    assert!(failure(standalone(&payload, &payload.nonce, &claims()))
+        .contains("expected ES256 or RS256"));
+}
+
+#[test]
+fn an_es256_proof_over_the_rsa_session_key_fails_closed() {
     let mut payload = payload();
     payload.tls_possession.as_mut().unwrap().tls_signature_alg = "ES256".to_owned();
-    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("RS256"));
+    assert!(failure(standalone(&payload, &payload.nonce, &claims())).contains("not P-256"));
 }
 
 #[test]
@@ -607,6 +615,34 @@ async fn a_chat_streams_through_unchanged_without_supplier_headers() {
         .keys()
         .all(|name| !name.as_str().starts_with("x-kubetee-")));
     assert!(!sent.contains_key(SELECTOR_HEADER));
+}
+
+#[tokio::test]
+async fn retiring_an_expired_connection_attests_again_before_chat_or_models() {
+    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    // The signed fixture is legacy evidence. Add an expired deadline only
+    // to the cache entry to test transport retirement, not v1 cryptography.
+    let mut connection = verifier.checkout().await.unwrap();
+    assert_eq!(connection.keyset_not_after, None);
+    connection.keyset_not_after = Some(Utc::now() - chrono::Duration::seconds(1));
+    verifier.pool.give_back(connection);
+    assert_eq!(verifier.idle_connections(), 0);
+    assert_eq!(round_trip(&verifier, TARGETS[0]).await.1, SSE.as_bytes());
+    assert_eq!(counts(&upstream), (2, 2, 1));
+
+    let mut connection = verifier.pool.take().unwrap();
+    connection.keyset_not_after = Some(Utc::now() - chrono::Duration::seconds(1));
+    verifier.pool.give_back(connection);
+    let request = Request::builder()
+        .header(AUTHORIZATION, "Bearer kt")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        verifier.models(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(counts(&upstream), (3, 3, 1));
+    assert_eq!(upstream.model_lists.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -3,7 +3,8 @@
 //!
 //! A connection enters the pool only after its attestation verified, and
 //! goes back after a response body has been read to its end. It is retired
-//! when it reaches its maximum age or request count, fails, or closes.
+//! when its keyset expires, it reaches its maximum age or request count,
+//! fails, or closes.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,6 +12,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
+use chrono::{DateTime, Utc};
 use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
 use tokio::task::JoinHandle;
@@ -53,12 +55,19 @@ pub struct Attested {
     pub sender: SendRequest<Body>,
     pub driver: JoinHandle<Result<(), hyper::Error>>,
     pub attested_at: Instant,
+    /// The quote-bound keyset's UTC deadline; legacy evidence has none.
+    pub keyset_not_after: Option<DateTime<Utc>>,
     pub requests: usize,
 }
 
 impl Attested {
     fn usable(&self, limits: Limits) -> bool {
-        self.attested_at.elapsed() < limits.max_age
+        self.usable_at(limits, Utc::now())
+    }
+
+    fn usable_at(&self, limits: Limits, now: DateTime<Utc>) -> bool {
+        self.keyset_not_after.is_none_or(|deadline| now < deadline)
+            && self.attested_at.elapsed() < limits.max_age
             && self.requests < limits.max_requests
             && !self.sender.is_closed()
             && !self.driver.is_finished()
@@ -82,6 +91,7 @@ impl std::fmt::Debug for Attested {
         formatter
             .debug_struct("Attested")
             .field("attested_at", &self.attested_at)
+            .field("keyset_not_after", &self.keyset_not_after)
             .field("requests", &self.requests)
             .finish_non_exhaustive()
     }
@@ -242,6 +252,88 @@ impl Drop for Lease {
 #[expect(clippy::unwrap_used, reason = "test values are known to be valid")]
 mod tests {
     use super::*;
+
+    /// Transport-only fixture: it exercises connection lifetime policy,
+    /// without claiming to supply a signed v1 quote.
+    async fn connection(not_after: Option<DateTime<Utc>>) -> (Attested, tokio::io::DuplexStream) {
+        let (client, peer) = tokio::io::duplex(1024);
+        let (sender, driver) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(client))
+                .await
+                .unwrap();
+        (
+            Attested {
+                sender,
+                driver: tokio::spawn(driver),
+                attested_at: Instant::now(),
+                keyset_not_after: not_after,
+                requests: 0,
+            },
+            peer,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_keyset_is_usable_only_before_its_exact_deadline() {
+        let deadline = "2099-01-01T00:00:00.123456789Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let (connection, _peer) = connection(Some(deadline)).await;
+        let limits = Limits::default();
+        assert!(connection.usable_at(limits, deadline - chrono::Duration::nanoseconds(1)));
+        assert!(!connection.usable_at(limits, deadline));
+        assert!(!connection.usable_at(limits, deadline + chrono::Duration::nanoseconds(1)));
+        connection.retire();
+    }
+
+    #[tokio::test]
+    async fn a_keyset_that_expires_while_idle_is_retired_on_checkout() {
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let (connection, _peer) = connection(Some(deadline)).await;
+        let pool = Pool::default();
+        pool.give_back(connection);
+        assert_eq!(pool.idle(), 1);
+        // Advance the cached deadline into the past without timing sleeps.
+        // The pool is otherwise unchanged and the transport is still live.
+        pool.idle.lock().unwrap()[0].keyset_not_after =
+            Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(pool.take().is_none());
+        assert_eq!(pool.idle(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_keyset_is_retired_when_its_response_finishes() {
+        let (connection, _peer) = connection(Some(Utc::now() - chrono::Duration::seconds(1))).await;
+        let pool = Pool::default();
+        pool.give_back(connection);
+        assert_eq!(pool.idle(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reused_connection_preserves_its_keyset_deadline() {
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let (connection, _peer) = connection(Some(deadline)).await;
+        let pool = Pool::default();
+        pool.give_back(connection);
+        let reused = pool.take().unwrap();
+        assert_eq!(reused.keyset_not_after, Some(deadline));
+        assert!(!reused.usable_at(Limits::default(), deadline));
+        reused.retire();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_connection_has_only_the_existing_pool_limits() {
+        let (mut connection, _peer) = connection(None).await;
+        let future = "2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let limits = Limits::default();
+        assert!(connection.usable_at(limits, future));
+        connection.requests = limits.max_requests;
+        assert!(!connection.usable_at(limits, future));
+        connection.requests = 0;
+        connection.attested_at = Instant::now().checked_sub(limits.max_age).unwrap();
+        assert!(!connection.usable_at(limits, future));
+        connection.retire();
+    }
 
     #[test]
     fn supplier_trailers_are_removed_and_data_is_untouched() {
