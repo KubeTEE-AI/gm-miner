@@ -73,6 +73,26 @@ pub struct BindingStatement {
 /// version tag.
 pub(crate) struct BindingGuard;
 
+/// Binding fields checked against the serving key and statement. The
+/// report data must still be authenticated by the quote before use.
+#[derive(Debug)]
+pub(crate) struct Binding {
+    pub report_data: [u8; 64],
+    pub not_after: DateTime<Utc>,
+}
+
+impl Binding {
+    /// Recheck after collateral fetching and quote verification, which may
+    /// have taken the connection past its keyset's deadline.
+    pub(crate) fn ensure_current(&self, now: DateTime<Utc>) -> Result<()> {
+        ensure!(
+            self.not_after > now,
+            "kubetee.attestation.v1 keyset is expired"
+        );
+        Ok(())
+    }
+}
+
 impl BindingGuard {
     /// Derive the binding to verify from `body`, or fail closed on any
     /// malformed, mixed, or v1-shape response that does not verify.
@@ -81,7 +101,12 @@ impl BindingGuard {
     ///
     /// Returns an error when the response is v1-shaped and the statement,
     /// keyset, or version check fails.
-    pub(crate) fn run(body: &[u8], nonce: &str, leaf: &[u8]) -> Result<Option<[u8; 64]>> {
+    pub(crate) fn run(
+        body: &[u8],
+        nonce: &str,
+        leaf: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<Option<Binding>> {
         let payload: Value =
             serde_json::from_slice(body).context("decode KubeTEE attestation response")?;
         let keyset_present = payload.get("keyset").is_some();
@@ -96,20 +121,33 @@ impl BindingGuard {
                     fields.bindings.version,
                     binding::PURPOSE
                 );
-                Self::verify_served_keyset(&fields.keyset, &fields.bindings.keyset_digest, leaf)?;
+                let not_after = Self::verify_served_keyset(
+                    &fields.keyset,
+                    &fields.bindings.keyset_digest,
+                    leaf,
+                )?;
                 let report_data = binding::report_data_of_statement(
                     &fields.bindings.report_data_statement,
                     &fields.bindings.keyset_digest,
                     nonce,
                 )?;
-                Ok(Some(report_data))
+                let binding = Binding {
+                    report_data,
+                    not_after,
+                };
+                binding.ensure_current(now)?;
+                Ok(Some(binding))
             }
             (false, false) => Ok(None),
             _ => bail!("KubeTEE attestation response has half a v1 binding"),
         }
     }
 
-    fn verify_served_keyset(keyset: &Value, stated_digest: &str, leaf: &[u8]) -> Result<()> {
+    fn verify_served_keyset(
+        keyset: &Value,
+        stated_digest: &str,
+        leaf: &[u8],
+    ) -> Result<DateTime<Utc>> {
         let (_, certificate) = parse_x509_certificate(leaf)
             .map_err(|error| anyhow!("parse KubeTEE TLS certificate: {error}"))?;
         let spki = certificate.public_key().raw;
@@ -140,11 +178,7 @@ impl BindingGuard {
         let expires = DateTime::parse_from_rfc3339(not_after)
             .context("kubetee.attestation.v1 keyset not_after is not RFC 3339")?
             .with_timezone(&Utc);
-        ensure!(
-            expires > Utc::now(),
-            "kubetee.attestation.v1 keyset is expired"
-        );
-        Ok(())
+        Ok(expires)
     }
 }
 
@@ -385,42 +419,75 @@ mod tests {
         let digest = binding::recompute_keyset_digest(&keyset).unwrap();
         let stmt = statement(&digest, FIXTURE_NONCE);
         let body = fixture_body(&keyset, &stmt, &digest);
-        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF)
+        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now())
             .unwrap()
             .unwrap();
         assert_eq!(
-            bound,
+            bound.report_data,
             binding::report_data_of_statement(&stmt, &digest, FIXTURE_NONCE).unwrap()
         );
-        assert_eq!(bound[32..], [0; 32]);
+        assert_eq!(bound.report_data[32..], [0; 32]);
+        assert_eq!(
+            bound.not_after,
+            "2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 
     #[test]
     fn a_legacy_response_binds_the_legacy_construction() {
         let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","quote":"","report_data_input":"sha512(nonce)"}"#;
-        assert!(BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF)
-            .unwrap()
-            .is_none());
+        assert!(
+            BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, Utc::now())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn a_v1_keyset_for_another_serving_key_fails_closed() {
         let body = self_consistent_body("2099-01-01T00:00:00Z", &"0".repeat(64));
-        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF).unwrap_err();
+        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
         assert!(format!("{error:#}").contains("serving key"));
     }
 
     #[test]
     fn a_v1_keyset_expired_fails_closed() {
         let body = self_consistent_body("2000-01-01T00:00:00Z", SPKI_SHA256);
-        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF).unwrap_err();
+        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
         assert!(format!("{error:#}").contains("expired"));
+    }
+
+    #[test]
+    fn a_v1_binding_expires_at_its_deadline_including_after_verification_work() {
+        let deadline = "2099-01-01T00:00:00.123456789Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let body = self_consistent_body("2099-01-01T00:00:00.123456789Z", SPKI_SHA256);
+        let before = deadline - chrono::Duration::nanoseconds(1);
+        let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, before)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.not_after, deadline);
+        binding.ensure_current(before).unwrap();
+        for now in [deadline, deadline + chrono::Duration::nanoseconds(1)] {
+            // The same check runs after collateral/quote verification, before
+            // a fresh attestation can authorize its first upstream request.
+            assert!(binding
+                .ensure_current(now)
+                .unwrap_err()
+                .to_string()
+                .contains("expired"));
+            assert!(BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, now)
+                .unwrap_err()
+                .to_string()
+                .contains("expired"));
+        }
     }
 
     #[test]
     fn a_half_v1_response_fails_closed() {
         let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","keyset":{}}"#;
-        let error = BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF).unwrap_err();
+        let error = BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
         assert!(format!("{error:#}").contains("half a v1 binding"));
     }
 

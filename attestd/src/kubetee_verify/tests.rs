@@ -618,6 +618,34 @@ async fn a_chat_streams_through_unchanged_without_supplier_headers() {
 }
 
 #[tokio::test]
+async fn retiring_an_expired_connection_attests_again_before_chat_or_models() {
+    let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
+    // The signed fixture is legacy evidence. Add an expired deadline only
+    // to the cache entry to test transport retirement, not v1 cryptography.
+    let mut connection = verifier.checkout().await.unwrap();
+    assert_eq!(connection.keyset_not_after, None);
+    connection.keyset_not_after = Some(Utc::now() - chrono::Duration::seconds(1));
+    verifier.pool.give_back(connection);
+    assert_eq!(verifier.idle_connections(), 0);
+    assert_eq!(round_trip(&verifier, TARGETS[0]).await.1, SSE.as_bytes());
+    assert_eq!(counts(&upstream), (2, 2, 1));
+
+    let mut connection = verifier.pool.take().unwrap();
+    connection.keyset_not_after = Some(Utc::now() - chrono::Duration::seconds(1));
+    verifier.pool.give_back(connection);
+    let request = Request::builder()
+        .header(AUTHORIZATION, "Bearer kt")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        verifier.models(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(counts(&upstream), (3, 3, 1));
+    assert_eq!(upstream.model_lists.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn an_attested_connection_is_reused_without_attesting_again() {
     let (verifier, upstream) = serve(Evidence::Genuine, Chat::Served, limits()).await;
     for selector in [TARGETS[0], TARGETS[1], TARGETS[5]] {

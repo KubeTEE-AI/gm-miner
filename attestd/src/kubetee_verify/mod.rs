@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use axum::body::{Body, Bytes};
 use axum::http::header::{AUTHORIZATION, HOST};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use chrono::{DateTime, Utc};
 use dcap_qvl::collateral::CollateralClient;
 use dcap_qvl::QuoteCollateralV3;
 use http_body_util::{BodyExt as _, Limited};
@@ -110,6 +111,8 @@ pub struct Attestation {
     pub pod: String,
     pub peer: SocketAddr,
     pub measurements: Measurements,
+    /// UTC keyset deadline, or no additional deadline for legacy evidence.
+    pub keyset_not_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -196,8 +199,8 @@ impl KubeteeVerifier {
         )
         .await
         .context("reading the KubeTEE chat request timed out")??;
-        let mut connection = self.checkout().await?;
         let upstream = upstream_request(request)?;
+        let mut connection = self.checkout().await?;
         connection.requests += 1;
         let response =
             match timeout(INFERENCE_TIMEOUT, connection.sender.send_request(upstream)).await {
@@ -269,13 +272,21 @@ impl KubeteeVerifier {
             }
             connection.retire();
         }
-        let (connection, _) = self.connect_and_attest().await?;
-        Ok(pool::Attested {
+        let (connection, attestation) = self.connect_and_attest().await?;
+        let connection = pool::Attested {
             sender: connection.sender,
             driver: connection.driver,
             attested_at: Instant::now(),
+            keyset_not_after: attestation.keyset_not_after,
             requests: 0,
-        })
+        };
+        // Fresh connections need the same final check as pooled ones: the
+        // keyset may have expired while attestation was being completed.
+        if !self.pool.usable(&connection) {
+            connection.retire();
+            bail!("KubeTEE connection expired or closed before its first request");
+        }
+        Ok(connection)
     }
 
     async fn connect_and_attest(&self) -> Result<(UpstreamConnection, Attestation)> {
@@ -329,8 +340,12 @@ impl KubeteeVerifier {
         })
         .await
         .context("KubeTEE attestation fetch timed out")??;
-        let binding = evidence::BindingGuard::run(&body, &nonce, connection.leaf.as_ref())
-            .context("kubetee.attestation.v1 binding")?;
+        // Keyset deadlines use UTC wall time throughout their lifetime.
+        // Collateral::now is only the quote appraisal clock (historical in
+        // offline fixtures), not a clock for live connection reuse.
+        let binding =
+            evidence::BindingGuard::run(&body, &nonce, connection.leaf.as_ref(), Utc::now())
+                .context("kubetee.attestation.v1 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         let quote =
@@ -345,13 +360,17 @@ impl KubeteeVerifier {
             connection.leaf.as_ref(),
             &claims,
             now,
-            binding,
+            binding.as_ref().map(|binding| binding.report_data),
         )?;
+        if let Some(binding) = &binding {
+            binding.ensure_current(Utc::now())?;
+        }
         evidence::log_attested(&payload.pod, &measurements);
         Ok(Attestation {
             pod: payload.pod,
             peer: connection.peer,
             measurements,
+            keyset_not_after: binding.map(|binding| binding.not_after),
         })
     }
 }

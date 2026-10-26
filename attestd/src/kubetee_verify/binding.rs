@@ -51,11 +51,15 @@ pub fn jcs(value: &Json) -> String {
             format!("[{}]", elements.join(","))
         }
         Json::Object(fields) => {
-            // BTreeMap's byte order over UTF-8 equals RFC 8785's UTF-16 code
-            // unit order for well-formed strings (UTF-8 preserves code point
-            // order and well-formed surrogates never serialize to ASCII).
+            // RFC 8785 orders names by UTF-16 code units. BTreeMap's UTF-8
+            // order differs for supplementary characters versus high BMP
+            // characters, so sort explicitly at every object level.
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_unstable_by(|(left, _), (right, _)| {
+                left.encode_utf16().cmp(right.encode_utf16())
+            });
             let entries = fields
-                .iter()
+                .into_iter()
                 .map(|(key, value)| format!("{}:{}", jcs_string(key), jcs(value)))
                 .collect::<Vec<_>>();
             format!("{{{}}}", entries.join(","))
@@ -227,6 +231,19 @@ mod tests {
     )]
 
     use super::*;
+
+    #[test]
+    fn jcs_orders_object_names_by_utf16_at_every_depth() {
+        let value = serde_json::json!({
+            "\u{e000}": "bmp",
+            "\u{1f600}": {"\u{e000}": "bmp", "\u{1f600}": "supplementary"},
+            "array": [{"\u{e000}": "bmp", "\u{1f600}": "supplementary"}]
+        });
+        assert_eq!(
+            jcs(&json_tree(&value).unwrap()),
+            "{\"array\":[{\"😀\":\"supplementary\",\"\u{e000}\":\"bmp\"}],\"😀\":{\"😀\":\"supplementary\",\"\u{e000}\":\"bmp\"},\"\u{e000}\":\"bmp\"}"
+        );
+    }
 
     // Cross-implementation conformance: generated with the shipped Python
     // builder (the supplier's Python implementation of this construction)
