@@ -22,6 +22,60 @@ use crate::eventlog::{self, Register};
 use crate::kubetee_verify::binding;
 use crate::tee_evidence;
 
+/// Repeated member names in the JSON response are rejected before
+/// `serde_json::Value` collapses them: RFC 8785 requires object member
+/// names be unique, so a served keyset with a repeated name is invalid JCS
+/// input. Names are compared after JSON string decoding, so different
+/// spellings of one name collide too.
+fn reject_duplicate_names(text: &str) -> Result<()> {
+    let mut stack: Vec<std::collections::BTreeSet<String>> = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => stack.push(std::collections::BTreeSet::new()),
+            '}' => {
+                stack
+                    .pop()
+                    .context("KubeTEE attestation response has unbalanced JSON")?;
+            }
+            '"' => {
+                let mut token = String::from('"');
+                while let Some(c) = chars.next() {
+                    token.push(c);
+                    match c {
+                        '\\' => token.push(
+                            chars
+                                .next()
+                                .context("KubeTEE attestation response has a truncated escape")?,
+                        ),
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+                while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&':') {
+                    if let Some(current) = stack.last_mut() {
+                        let name: String = serde_json::from_str(&token)
+                            .context("KubeTEE attestation response has a malformed member name")?;
+                        ensure!(
+                            current.insert(name.clone()),
+                            "KubeTEE attestation response has duplicate member name {name}"
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ensure!(
+        stack.is_empty(),
+        "KubeTEE attestation response has unbalanced JSON"
+    );
+    Ok(())
+}
+
 /// The signature algorithms a TLS-possession proof may name: `ES256` (ECDSA
 /// over SHA-256 on P-256 — the per-boot serving key) and `RS256` (RSASSA-
 /// PKCS1-v1_5 over SHA-256 — a legacy RSA key). The proof is accepted in
@@ -107,6 +161,9 @@ impl BindingGuard {
         leaf: &[u8],
         now: DateTime<Utc>,
     ) -> Result<Option<Binding>> {
+        reject_duplicate_names(
+            std::str::from_utf8(body).context("KubeTEE attestation response is not UTF-8")?,
+        )?;
         let payload: Value =
             serde_json::from_slice(body).context("decode KubeTEE attestation response")?;
         let keyset_present = payload.get("keyset").is_some();
@@ -178,6 +235,13 @@ impl BindingGuard {
         let expires = DateTime::parse_from_rfc3339(not_after)
             .context("kubetee.attestation.v1 keyset not_after is not RFC 3339")?
             .with_timezone(&Utc);
+        let certificate_expires =
+            DateTime::from_timestamp(certificate.validity().not_after.timestamp(), 0)
+                .context("KubeTEE TLS certificate has an invalid not_after")?;
+        ensure!(
+            expires <= certificate_expires,
+            "kubetee.attestation.v1 keyset outlives the serving certificate"
+        );
         Ok(expires)
     }
 }
@@ -321,14 +385,12 @@ fn verify_tls_possession(possession: &TlsPossession, nonce: &str, leaf: &[u8]) -
                         .is_some_and(|curve| curve == OID_EC_P256),
                 "KubeTEE TLS-possession signature is ES256 but the certificate key is not P-256"
             );
-            // A 64-byte signature is the raw r||s encoding (JOSE style, what
-            // KubeTEE's per-boot signer emits); anything else is DER.
+            // The encoding is not reliably signable from the byte length:
+            // raw r||s is always 64 bytes, but so is a DER signature whose
+            // r and s integers are short. Accept either form over either
+            // length and let verification — not classification — decide.
             let algorithms: &[&dyn ring::signature::VerificationAlgorithm] =
-                if signature.len() == 64 {
-                    &[&ECDSA_P256_SHA256_FIXED]
-                } else {
-                    &[&ECDSA_P256_SHA256_ASN1]
-                };
+                &[&ECDSA_P256_SHA256_FIXED, &ECDSA_P256_SHA256_ASN1];
             algorithms
                 .iter()
                 .find_map(|algorithm| {
@@ -376,12 +438,32 @@ mod tests {
         include_bytes!("../../tests/fixtures/kubetee/ec_session_leaf.der");
     const EC_SESSION_KEY: &[u8] =
         include_bytes!("../../tests/fixtures/kubetee/ec_session_leaf_key.pk8");
+    /// A leaf whose P-256 key was constructed to verify
+    /// `ES256_SHORT_DER_SIG`: a valid ASN.1 DER ES256 signature of exactly
+    /// 64 bytes (28-byte `r` and `s`, each DER-padded to 29). Signing
+    /// cannot practically produce that length (probability ~2^-47), so the
+    /// fixture is generated in reverse — short `r`/`s` chosen first, the
+    /// verifying key derived from them. See the fixtures README.
+    const ES256_SHORT_DER_LEAF: &[u8] =
+        include_bytes!("../../tests/fixtures/kubetee/es256_short_der_leaf.der");
+    const ES256_SHORT_DER_SIG: &[u8] =
+        include_bytes!("../../tests/fixtures/kubetee/es256_short_der_sig.bin");
     const FIXTURE_NONCE: &str = "cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a";
     const FIXTURE_KEYSET_DIGEST: &str =
         "sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d";
     const FIXTURE_STATEMENT: &str = r#"{"keyset_digest":"sha256:64f6b8c71a0452909b382f5abcaaa6a76ae5b58bf930ff8f78f5074e4a64873d","nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","purpose":"kubetee.attestation.v1"}"#;
 
     const SPKI_SHA256: &str = "3f728244ad1bb95542b14cdbf7f637105dc588f8958c862e4beffc450c000cd3";
+
+    /// A fixed instant inside every fixture certificate's validity window,
+    /// so keyset-deadline tests stay deterministic forever (`SESSION_LEAF`
+    /// expires 2026-12-21T10:08:05Z and bounds every keyset deadline).
+    fn test_now() -> DateTime<Utc> {
+        "2026-11-01T00:00:00Z".parse().unwrap()
+    }
+
+    /// `SESSION_LEAF`'s `not_after`, the latest deadline a keyset may claim.
+    const SESSION_LEAF_EXPIRY: &str = "2026-12-21T10:08:05Z";
 
     fn v1_keyset(not_after: &str, spki: &str) -> Value {
         serde_json::json!({
@@ -415,11 +497,14 @@ mod tests {
 
     #[test]
     fn a_v1_response_binds_the_serving_key() {
-        let keyset = v1_keyset("2099-01-01T00:00:00Z", SPKI_SHA256);
+        // SESSION_LEAF_EXPIRY: the certificate's own not_after — what the
+        // production gateway copies into the keyset, and the latest deadline
+        // the bound in verify_served_keyset accepts.
+        let keyset = v1_keyset(SESSION_LEAF_EXPIRY, SPKI_SHA256);
         let digest = binding::recompute_keyset_digest(&keyset).unwrap();
         let stmt = statement(&digest, FIXTURE_NONCE);
         let body = fixture_body(&keyset, &stmt, &digest);
-        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now())
+        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, test_now())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -429,7 +514,7 @@ mod tests {
         assert_eq!(bound.report_data[32..], [0; 32]);
         assert_eq!(
             bound.not_after,
-            "2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            SESSION_LEAF_EXPIRY.parse::<DateTime<Utc>>().unwrap()
         );
     }
 
@@ -445,24 +530,62 @@ mod tests {
 
     #[test]
     fn a_v1_keyset_for_another_serving_key_fails_closed() {
-        let body = self_consistent_body("2099-01-01T00:00:00Z", &"0".repeat(64));
-        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
+        let body = self_consistent_body(SESSION_LEAF_EXPIRY, &"0".repeat(64));
+        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, test_now()).unwrap_err();
         assert!(format!("{error:#}").contains("serving key"));
     }
 
     #[test]
     fn a_v1_keyset_expired_fails_closed() {
         let body = self_consistent_body("2000-01-01T00:00:00Z", SPKI_SHA256);
-        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
+        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, test_now()).unwrap_err();
         assert!(format!("{error:#}").contains("expired"));
+    }
+
+    /// A keyset may not claim a deadline past the serving certificate's
+    /// `not_after`, or the pool could keep reusing the connection after the
+    /// certificate itself has expired.
+    #[test]
+    fn a_v1_keyset_outliving_the_serving_certificate_fails_closed() {
+        let body = self_consistent_body("2027-01-01T00:00:00Z", SPKI_SHA256);
+        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, test_now()).unwrap_err();
+        assert!(format!("{error:#}").contains("outlives the serving certificate"));
+    }
+
+    /// RFC 8785 requires object member names be unique. `serde_json::Value`
+    /// collapses a repeated name (last one wins) and would digest the
+    /// collapsed keyset, so a duplicate anywhere in the response must fail
+    /// before parsing — including a different spelling of one name.
+    #[test]
+    fn a_response_with_duplicate_member_names_fails_closed() {
+        let body = format!(
+            r#"{{"nonce":"{FIXTURE_NONCE}","nonce":"{FIXTURE_NONCE}","keyset":{{"subject":"a","subject":"b","not_after":"{SESSION_LEAF_EXPIRY}","tls_public_keys":[],"signing_keys":[],"e2ee_keys":[]}},"bindings":{{"version":"kubetee.attestation.v1","report_data_statement":"x","keyset_digest":"sha256:0"}}}}"#
+        );
+        let error = BindingGuard::run(body.as_bytes(), FIXTURE_NONCE, SESSION_LEAF, test_now())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate member name"));
+    }
+
+    #[test]
+    fn a_response_with_duplicate_names_spelled_differently_fails_closed() {
+        // `"\u006eonce"` decodes to `nonce`: one name, two spellings.
+        let body = format!(
+            r#"{{"nonce":"{FIXTURE_NONCE}","\u006eonce":"{FIXTURE_NONCE}","bindings":null}}"#
+        );
+        let error = BindingGuard::run(body.as_bytes(), FIXTURE_NONCE, SESSION_LEAF, test_now())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate member name"));
     }
 
     #[test]
     fn a_v1_binding_expires_at_its_deadline_including_after_verification_work() {
-        let deadline = "2099-01-01T00:00:00.123456789Z"
+        // 2026-12-20: after TEST_NOW and before SESSION_LEAF_EXPIRY, so the
+        // deadline is within the certificate bound and expiry — not the
+        // bound — is what fails here.
+        let deadline = "2026-12-20T00:00:00.123456789Z"
             .parse::<DateTime<Utc>>()
             .unwrap();
-        let body = self_consistent_body("2099-01-01T00:00:00.123456789Z", SPKI_SHA256);
+        let body = self_consistent_body("2026-12-20T00:00:00.123456789Z", SPKI_SHA256);
         let before = deadline - chrono::Duration::nanoseconds(1);
         let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, before)
             .unwrap()
@@ -524,6 +647,30 @@ mod tests {
             };
             verify_tls_possession(&possession, FIXTURE_NONCE, EC_SESSION_LEAF).unwrap();
         }
+    }
+
+    /// A valid ASN.1 DER ES256 signature can be exactly 64 bytes (short `r`
+    /// and `s` integers) and must verify; the length-based dispatch sent it
+    /// to the raw `r||s` verifier alone, which rejects it — both failures
+    /// are pinned here.
+    #[test]
+    fn a_64_byte_der_es256_proof_verifies() {
+        assert_eq!(ES256_SHORT_DER_SIG.len(), 64);
+        let (_, certificate) = parse_x509_certificate(ES256_SHORT_DER_LEAF).unwrap();
+        // The old length-based classification: 64 bytes -> raw r||s only,
+        // and that verifier rejects this valid DER signature.
+        assert!(UnparsedPublicKey::new(
+            &ECDSA_P256_SHA256_FIXED,
+            &certificate.public_key().subject_public_key.data
+        )
+        .verify(FIXTURE_NONCE.as_bytes(), ES256_SHORT_DER_SIG)
+        .is_err());
+        let possession = TlsPossession {
+            tls_signature: STANDARD.encode(ES256_SHORT_DER_SIG),
+            tls_signature_alg: ES256.to_owned(),
+            tls_cert_sha256: hex::encode(Sha256::digest(ES256_SHORT_DER_LEAF)),
+        };
+        verify_tls_possession(&possession, FIXTURE_NONCE, ES256_SHORT_DER_LEAF).unwrap();
     }
 
     /// A proof signed by some other P-256 key does not verify against the
