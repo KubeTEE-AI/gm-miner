@@ -17,3 +17,15 @@ the proof carries ECDSA over SHA-256 rather than RS256.
 `test_ca.der`, `test_leaf.der` and `test_leaf_key.pk8` are a throwaway PKI for
 the tests' local TLS upstream: a root trusted only by those tests and an RSA
 leaf for `llm.kubetee.ai` it signed. The key protects nothing.
+
+`ec_short_der_leaf.der` and `ec_short_der_signature.der` are a deterministic,
+valid P-256/SHA-256 possession proof whose DER encoding is exactly 64 bytes.
+This catches dispatch that mistakes every 64-byte signature for raw `r||s`.
+`generate_short_der_fixture.py` reproduces them with Python `cryptography`:
+it chooses an on-curve point R with a 29-byte x-coordinate r and a 29-byte s,
+then derives Q = r^-1(sR - SHA256(nonce)G). No random signing or search for
+short signature integers is involved. The nonce is the recorded fixture nonce.
+A fixed throwaway Ed25519 issuer signs a certificate containing Q; its chain
+is not trusted or used by this possession-proof unit test. The private key
+for Q is not known. This fixture proves signature encoding handling only,
+not a supplier attestation or TLS handshake.

@@ -107,13 +107,13 @@ impl BindingGuard {
         leaf: &[u8],
         now: DateTime<Utc>,
     ) -> Result<Option<Binding>> {
-        let payload: Value =
-            serde_json::from_slice(body).context("decode KubeTEE attestation response")?;
+        let payload = crate::strict_json::parse_unique_json(body)
+            .context("decode KubeTEE attestation response")?;
         let keyset_present = payload.get("keyset").is_some();
         let bindings_present = payload.get("bindings").is_some();
         match (keyset_present, bindings_present) {
             (true, true) => {
-                let fields: BindingFields = serde_json::from_slice(body)
+                let fields: BindingFields = serde_json::from_value(payload)
                     .context("decode kubetee.attestation.v1 binding fields")?;
                 ensure!(
                     fields.bindings.version == binding::PURPOSE,
@@ -178,6 +178,13 @@ impl BindingGuard {
         let expires = DateTime::parse_from_rfc3339(not_after)
             .context("kubetee.attestation.v1 keyset not_after is not RFC 3339")?
             .with_timezone(&Utc);
+        let certificate_expires =
+            DateTime::from_timestamp(certificate.validity().not_after.timestamp(), 0)
+                .context("KubeTEE TLS certificate expiry is outside the supported range")?;
+        ensure!(
+            expires <= certificate_expires,
+            "kubetee.attestation.v1 keyset not_after exceeds the serving certificate expiry"
+        );
         Ok(expires)
     }
 }
@@ -321,14 +328,10 @@ fn verify_tls_possession(possession: &TlsPossession, nonce: &str, leaf: &[u8]) -
                         .is_some_and(|curve| curve == OID_EC_P256),
                 "KubeTEE TLS-possession signature is ES256 but the certificate key is not P-256"
             );
-            // A 64-byte signature is the raw r||s encoding (JOSE style, what
-            // KubeTEE's per-boot signer emits); anything else is DER.
+            // Both encodings are accepted. DER can also be 64 bytes when
+            // its integers are short, so length cannot distinguish them.
             let algorithms: &[&dyn ring::signature::VerificationAlgorithm] =
-                if signature.len() == 64 {
-                    &[&ECDSA_P256_SHA256_FIXED]
-                } else {
-                    &[&ECDSA_P256_SHA256_ASN1]
-                };
+                &[&ECDSA_P256_SHA256_FIXED, &ECDSA_P256_SHA256_ASN1];
             algorithms
                 .iter()
                 .find_map(|algorithm| {
@@ -383,6 +386,10 @@ mod tests {
 
     const SPKI_SHA256: &str = "3f728244ad1bb95542b14cdbf7f637105dc588f8958c862e4beffc450c000cd3";
 
+    fn fixture_now() -> DateTime<Utc> {
+        "2026-10-01T00:00:00Z".parse().unwrap()
+    }
+
     fn v1_keyset(not_after: &str, spki: &str) -> Value {
         serde_json::json!({
             "subject": "kubetee.attestation.v1/llm.kubetee.ai",
@@ -415,11 +422,11 @@ mod tests {
 
     #[test]
     fn a_v1_response_binds_the_serving_key() {
-        let keyset = v1_keyset("2099-01-01T00:00:00Z", SPKI_SHA256);
+        let keyset = v1_keyset("2026-12-01T00:00:00Z", SPKI_SHA256);
         let digest = binding::recompute_keyset_digest(&keyset).unwrap();
         let stmt = statement(&digest, FIXTURE_NONCE);
         let body = fixture_body(&keyset, &stmt, &digest);
-        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now())
+        let bound = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -429,7 +436,7 @@ mod tests {
         assert_eq!(bound.report_data[32..], [0; 32]);
         assert_eq!(
             bound.not_after,
-            "2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            "2026-12-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
         );
     }
 
@@ -437,7 +444,7 @@ mod tests {
     fn a_legacy_response_binds_the_legacy_construction() {
         let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","quote":"","report_data_input":"sha512(nonce)"}"#;
         assert!(
-            BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, Utc::now())
+            BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
                 .unwrap()
                 .is_none()
         );
@@ -445,24 +452,26 @@ mod tests {
 
     #[test]
     fn a_v1_keyset_for_another_serving_key_fails_closed() {
-        let body = self_consistent_body("2099-01-01T00:00:00Z", &"0".repeat(64));
-        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
+        let body = self_consistent_body("2026-12-01T00:00:00Z", &"0".repeat(64));
+        let error =
+            BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap_err();
         assert!(format!("{error:#}").contains("serving key"));
     }
 
     #[test]
     fn a_v1_keyset_expired_fails_closed() {
         let body = self_consistent_body("2000-01-01T00:00:00Z", SPKI_SHA256);
-        let error = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
+        let error =
+            BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap_err();
         assert!(format!("{error:#}").contains("expired"));
     }
 
     #[test]
     fn a_v1_binding_expires_at_its_deadline_including_after_verification_work() {
-        let deadline = "2099-01-01T00:00:00.123456789Z"
+        let deadline = "2026-12-01T00:00:00.123456789Z"
             .parse::<DateTime<Utc>>()
             .unwrap();
-        let body = self_consistent_body("2099-01-01T00:00:00.123456789Z", SPKI_SHA256);
+        let body = self_consistent_body("2026-12-01T00:00:00.123456789Z", SPKI_SHA256);
         let before = deadline - chrono::Duration::nanoseconds(1);
         let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, before)
             .unwrap()
@@ -487,7 +496,8 @@ mod tests {
     #[test]
     fn a_half_v1_response_fails_closed() {
         let body = br#"{"nonce":"cf954b673d4aa6e859a1ac77f9442cd217de4f3e39c95aebcc8bf6652abafe6a","keyset":{}}"#;
-        let error = BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, Utc::now()).unwrap_err();
+        let error =
+            BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap_err();
         assert!(format!("{error:#}").contains("half a v1 binding"));
     }
 
@@ -502,6 +512,141 @@ mod tests {
         assert_eq!(
             hex::encode(bound),
             "9e4867826f437965258b4bcf964e603e30d31b662a4f3ef0ffc50cba611633710000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn a_valid_64_byte_der_es256_proof_is_not_misclassified_as_fixed() {
+        let leaf = include_bytes!("../../tests/fixtures/kubetee/ec_short_der_leaf.der");
+        let signature = include_bytes!("../../tests/fixtures/kubetee/ec_short_der_signature.der");
+        assert_eq!(signature.len(), 64);
+        let (_, certificate) = parse_x509_certificate(leaf).unwrap();
+        // Prove this is a valid DER signature before exercising dispatch.
+        UnparsedPublicKey::new(
+            &ECDSA_P256_SHA256_ASN1,
+            &certificate.public_key().subject_public_key.data,
+        )
+        .verify(FIXTURE_NONCE.as_bytes(), signature)
+        .unwrap();
+        let possession = TlsPossession {
+            tls_signature: STANDARD.encode(signature),
+            tls_signature_alg: ES256.to_owned(),
+            tls_cert_sha256: hex::encode(Sha256::digest(leaf)),
+        };
+        verify_tls_possession(&possession, FIXTURE_NONCE, leaf).unwrap();
+        assert!(verify_tls_possession(&possession, "different-nonce", leaf).is_err());
+    }
+
+    #[test]
+    fn a_keyset_must_not_outlive_its_serving_certificate() {
+        let (_, certificate) = parse_x509_certificate(SESSION_LEAF).unwrap();
+        let cert_deadline =
+            DateTime::from_timestamp(certificate.validity().not_after.timestamp(), 0).unwrap();
+        assert_eq!(
+            cert_deadline,
+            "2026-12-21T10:08:05Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        for deadline in [cert_deadline - chrono::Duration::seconds(1), cert_deadline] {
+            let body = self_consistent_body(&deadline.to_rfc3339(), SPKI_SHA256);
+            let binding = BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.not_after, deadline);
+        }
+        let later = cert_deadline + chrono::Duration::nanoseconds(1);
+        let body = self_consistent_body(&later.to_rfc3339(), SPKI_SHA256);
+        let error =
+            BindingGuard::run(&body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap_err();
+        assert!(format!("{error:#}").contains("certificate expiry"));
+    }
+
+    // Build the digest over serde's last-value-wins interpretation to
+    // reproduce ambiguity that is lost before canonicalization.
+    fn body_with_raw_keyset(raw: &str) -> Vec<u8> {
+        let collapsed: Value = serde_json::from_str(raw).unwrap();
+        let digest = binding::recompute_keyset_digest(&collapsed).unwrap();
+        let body: Value = serde_json::from_slice(&fixture_body(
+            &collapsed,
+            &statement(&digest, FIXTURE_NONCE),
+            &digest,
+        ))
+        .unwrap();
+        format!("{{\"keyset\":{raw},\"bindings\":{}}}", body["bindings"]).into_bytes()
+    }
+
+    #[test]
+    fn duplicate_names_in_a_digest_consistent_keyset_fail_closed() {
+        let original = v1_keyset("2026-12-01T00:00:00Z", SPKI_SHA256).to_string();
+        let variants = [
+            original.replace(
+                "\"not_after\":",
+                "\"not_after\":\"2000-01-01T00:00:00Z\",\"not_after\":",
+            ),
+            original.replace(
+                "\"not_after\":",
+                r#""not\u005fafter":"2000-01-01T00:00:00Z","not_after":"#,
+            ),
+            original.replace("\"domain\":", "\"domain\":\"wrong.example\",\"domain\":"),
+            original.replace(
+                "\"signing_keys\":[]",
+                r#""signing_keys":[{"nested":{"key":"first","key":"last"}}]"#,
+            ),
+        ];
+        for raw in variants {
+            let error = BindingGuard::run(
+                &body_with_raw_keyset(&raw),
+                FIXTURE_NONCE,
+                SESSION_LEAF,
+                fixture_now(),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("duplicate object key"));
+        }
+    }
+
+    #[test]
+    fn duplicate_top_level_names_fail_closed_even_for_legacy_evidence() {
+        let original = self_consistent_body("2026-12-01T00:00:00Z", SPKI_SHA256);
+        let duplicated = format!(
+            "{{\"keyset\":{{}},{}",
+            std::str::from_utf8(&original)
+                .unwrap()
+                .strip_prefix('{')
+                .unwrap()
+        );
+        for body in [
+            duplicated.as_bytes(),
+            br#"{"nonce":"first","nonce":"last"}"#,
+            br#"{"unknown":{"name":"first","n\u0061me":"last"}}"#,
+        ] {
+            let error =
+                BindingGuard::run(body, FIXTURE_NONCE, SESSION_LEAF, fixture_now()).unwrap_err();
+            assert!(format!("{error:#}").contains("duplicate object key"));
+        }
+    }
+
+    #[test]
+    fn unique_unordered_json_with_whitespace_and_legacy_numbers_still_passes() {
+        let keyset = format!(
+            r#"{{
+            "tls_public_keys": [{{"spki_sha256":"{SPKI_SHA256}", "domain":"llm.kubetee.ai"}}],
+            "subject":"kubetee.attestation.v1/llm.kubetee.ai", "signing_keys": [],
+            "not_after":"2026-12-01T00:00:00Z", "e2ee_keys": []
+        }}"#
+        );
+        assert!(BindingGuard::run(
+            &body_with_raw_keyset(&keyset),
+            FIXTURE_NONCE,
+            SESSION_LEAF,
+            fixture_now()
+        )
+        .unwrap()
+        .is_some());
+        let legacy = br#"{"nonce":"value", "unknown":[-12,1.25,18446744073709551615,true,null,{"name":"value"}]}"#;
+        assert!(
+            BindingGuard::run(legacy, FIXTURE_NONCE, SESSION_LEAF, fixture_now())
+                .unwrap()
+                .is_none()
         );
     }
 

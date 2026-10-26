@@ -317,6 +317,7 @@ mod tests {
         pool.give_back(connection);
         let reused = pool.take().unwrap();
         assert_eq!(reused.keyset_not_after, Some(deadline));
+        assert!(!reused.usable_at(Limits::default(), deadline));
         reused.retire();
     }
 

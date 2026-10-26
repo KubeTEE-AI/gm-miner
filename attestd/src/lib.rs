@@ -20,6 +20,7 @@ pub mod near_verify;
 pub mod provider;
 pub mod ratls;
 pub mod report_data;
+mod strict_json;
 pub mod tee_evidence;
 pub mod upstream_proxy;
 
