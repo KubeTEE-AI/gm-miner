@@ -87,20 +87,54 @@ impl AttestationPayload {
             "KubeTEE nonce is absent or malformed"
         );
         if let (Some(tee), Some(tee_type)) = (self.tee.as_deref(), self.tee_type.as_deref()) {
-            ensure!(tee == tee_type, "KubeTEE conflicting platform discriminators");
+            ensure!(
+                tee == tee_type,
+                "KubeTEE conflicting platform discriminators"
+            );
         }
-        let tee = self.tee_type.as_ref().or(self.tee.as_ref()).map(String::as_str);
+        let tee = self
+            .tee_type
+            .as_ref()
+            .or(self.tee.as_ref())
+            .map(String::as_str);
         match expected {
             super::Platform::SevSnp => {
-                ensure!(tee == Some("snp"), "SNP configured: response is not an SNP platform");
+                ensure!(
+                    tee == Some("snp"),
+                    "SNP configured: response is not an SNP platform"
+                );
                 ensure!(self.quote.is_empty(), "SNP payload contains a TDX quote");
-                ensure!(self.runtime_class.as_deref() == Some("kata-qemu-snp-runtime-rs"), "SNP payload has the wrong measured runtime class");
-                ensure!(self.evidence.as_ref().and_then(|evidence| evidence.get("snp")).is_some(), "SNP native evidence is missing");
+                ensure!(
+                    self.runtime_class.as_deref() == Some("kata-qemu-snp-runtime-rs"),
+                    "SNP payload has the wrong measured runtime class"
+                );
+                ensure!(
+                    self.evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.get("snp"))
+                        .is_some(),
+                    "SNP native evidence is missing"
+                );
             }
             super::Platform::Tdx => {
-                ensure!(matches!(tee, None | Some("tdx")), "TDX configured: response has another platform");
-                ensure!(self.evidence.as_ref().and_then(|evidence| evidence.get("snp")).is_none(), "TDX payload contains SNP native evidence");
-                ensure!(matches!(self.runtime_class.as_deref(), None | Some("kata-qemu-tdx-runtime-rs")), "TDX payload has the wrong measured runtime class");
+                ensure!(
+                    matches!(tee, None | Some("tdx")),
+                    "TDX configured: response has another platform"
+                );
+                ensure!(
+                    self.evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.get("snp"))
+                        .is_none(),
+                    "TDX payload contains SNP native evidence"
+                );
+                ensure!(
+                    matches!(
+                        self.runtime_class.as_deref(),
+                        None | Some("kata-qemu-tdx-runtime-rs")
+                    ),
+                    "TDX payload has the wrong measured runtime class"
+                );
             }
         }
         Ok(())

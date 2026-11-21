@@ -393,7 +393,9 @@ impl KubeteeVerifier {
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
         payload.ensure_platform(self.platform)?;
         let measurements = if self.platform == Platform::SevSnp {
-            let snp = payload.snp_evidence()?.context("SNP native evidence is missing")?;
+            let snp = payload
+                .snp_evidence()?
+                .context("SNP native evidence is missing")?;
             let report = snp::verify(snp, &binding.report_data).await?;
             policy::accept(&report)?;
             evidence::verify_tls_possession(
