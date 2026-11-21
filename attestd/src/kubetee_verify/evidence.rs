@@ -34,11 +34,77 @@ const RS256: &str = "RS256";
 #[derive(Debug, Deserialize)]
 pub struct AttestationPayload {
     pub nonce: String,
+    #[serde(default)]
+    pub tee: Option<String>,
+    #[serde(default)]
+    pub tee_type: Option<String>,
+    #[serde(default)]
+    pub runtime_class: Option<String>,
+    /// Required by the TDX arm after its explicit platform dispatch.
+    #[serde(default)]
     pub quote: String,
     pub cc_eventlog: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Value>,
     pub tls_possession: Option<TlsPossession>,
     #[serde(default)]
     pub pod: String,
+}
+
+impl AttestationPayload {
+    pub(crate) fn snp_evidence(&self) -> Result<Option<&Value>> {
+        ensure!(
+            self.nonce.len() <= 128 && self.nonce.bytes().all(|b| b.is_ascii_hexdigit()),
+            "KubeTEE nonce is absent or malformed"
+        );
+        if let (Some(tee), Some(tee_type)) = (self.tee.as_deref(), self.tee_type.as_deref()) {
+            ensure!(
+                tee == tee_type,
+                "KubeTEE conflicting platform discriminators"
+            );
+        }
+        let tee = self.tee_type.as_ref().or(self.tee.as_ref());
+        match tee.map(String::as_str) {
+            Some("snp") => Ok(Some(
+                self.evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.get("snp"))
+                    .filter(|evidence| {
+                        evidence.get("schema").and_then(Value::as_str)
+                            == Some("kubetee.snp-evidence/1")
+                    })
+                    .context("KubeTEE SNP evidence is missing or has an unsupported schema")?,
+            )),
+            // Pre-TEE-selector responses are the original TDX payload shape.
+            Some("tdx") | None => Ok(None),
+            Some(other) => bail!("KubeTEE endpoint reported unsupported TEE {other}"),
+        }
+    }
+
+    pub(crate) fn ensure_platform(&self, expected: super::Platform) -> Result<()> {
+        ensure!(
+            self.nonce.len() <= 128 && self.nonce.bytes().all(|b| b.is_ascii_hexdigit()),
+            "KubeTEE nonce is absent or malformed"
+        );
+        if let (Some(tee), Some(tee_type)) = (self.tee.as_deref(), self.tee_type.as_deref()) {
+            ensure!(tee == tee_type, "KubeTEE conflicting platform discriminators");
+        }
+        let tee = self.tee_type.as_ref().or(self.tee.as_ref()).map(String::as_str);
+        match expected {
+            super::Platform::SevSnp => {
+                ensure!(tee == Some("snp"), "SNP configured: response is not an SNP platform");
+                ensure!(self.quote.is_empty(), "SNP payload contains a TDX quote");
+                ensure!(self.runtime_class.as_deref() == Some("kata-qemu-snp-runtime-rs"), "SNP payload has the wrong measured runtime class");
+                ensure!(self.evidence.as_ref().and_then(|evidence| evidence.get("snp")).is_some(), "SNP native evidence is missing");
+            }
+            super::Platform::Tdx => {
+                ensure!(matches!(tee, None | Some("tdx")), "TDX configured: response has another platform");
+                ensure!(self.evidence.as_ref().and_then(|evidence| evidence.get("snp")).is_none(), "TDX payload contains SNP native evidence");
+                ensure!(matches!(self.runtime_class.as_deref(), None | Some("kata-qemu-tdx-runtime-rs")), "TDX payload has the wrong measured runtime class");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A signature over the nonce made with the serving certificate's key.
@@ -198,14 +264,33 @@ pub struct Measurements {
     pub mrtd: Register,
     pub mr_config_id: Register,
     pub rtmrs: [Register; 4],
+    /// SNP's mandatory 48-byte AMD guest launch measurement. Distinct from
+    /// the 32-byte init-data digest passed through `HOST_DATA`.
+    pub launch_digest: [u8; 48],
+    pub host_data: Option<[u8; 32]>,
+    pub init_data: Option<[u8; 32]>,
 }
 
 impl Measurements {
+    pub(crate) fn of_snp(report: &sev::firmware::guest::AttestationReport) -> Self {
+        Self {
+            mrtd: [0; 48],
+            mr_config_id: [0; 48],
+            rtmrs: [[0; 48]; 4],
+            launch_digest: report.measurement,
+            host_data: Some(report.host_data),
+            init_data: Some(report.host_data),
+        }
+    }
+
     fn of(td: &TDReport10) -> Self {
         Self {
             mrtd: td.mr_td,
             mr_config_id: td.mr_config_id,
             rtmrs: [td.rt_mr0, td.rt_mr1, td.rt_mr2, td.rt_mr3],
+            launch_digest: [0; 48],
+            host_data: None,
+            init_data: None,
         }
     }
 }
@@ -272,7 +357,11 @@ fn verify_event_log(log: &str, quoted: &[Register; 4]) -> Result<()> {
 /// accepted — and `RS256` is RSASSA-PKCS1-v1_5 over SHA-256 with its RSA
 /// key. Any other algorithm, or one that does not match the certificate's
 /// key type, fails closed.
-fn verify_tls_possession(possession: &TlsPossession, nonce: &str, leaf: &[u8]) -> Result<()> {
+pub(crate) fn verify_tls_possession(
+    possession: &TlsPossession,
+    nonce: &str,
+    leaf: &[u8],
+) -> Result<()> {
     let claimed = hex::decode(&possession.tls_cert_sha256)
         .context("decode KubeTEE TLS certificate fingerprint")?;
     ensure!(
@@ -330,6 +419,8 @@ pub fn log_attested(pod: &str, measurements: &Measurements) {
         pod,
         mrtd = hex::encode(measurements.mrtd),
         mr_config_id = hex::encode(measurements.mr_config_id),
+        launch_digest = hex::encode(measurements.launch_digest),
+        host_data = measurements.host_data.map(hex::encode),
         rtmr0,
         rtmr1,
         rtmr2,

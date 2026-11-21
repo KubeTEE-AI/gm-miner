@@ -677,6 +677,7 @@ async fn serve(evidence: Evidence, chat: Chat, limits: Limits) -> (KubeteeVerifi
     let verifier = KubeteeVerifier::with_parts(
         roots,
         Some(address),
+        Platform::Tdx,
         Arc::new(FixtureChain),
         fixture_nonce,
         limits,
