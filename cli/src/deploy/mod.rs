@@ -6,16 +6,17 @@
 //! measured hashes against the registry allow-list, and registers the
 //! image.
 //!
-//! Phala Cloud owns the confidential VM, the KMS, and `app_id`
-//! authorization. The trust check therefore rests entirely on verifying
-//! the deployed CVM's compose hash and OS image hash against the
-//! registry's approved `ImageVersion` list — there is no client-side KMS
-//! trust-pinning to do.
+//! Phala Cloud owns the confidential VM, KMS, and `app_id` authorization.
+//! New CVMs select a Phala KMS contract at creation; existing CVMs keep that
+//! selection. The trust check rests on verifying the deployed CVM's compose
+//! hash and OS image hash against the registry's approved `ImageVersion` list.
 //!
-//! Steps (orchestrated from `commands::deploy::cmd_deploy`):
-//!   1. Read provider API keys from config; error early if none set.
+//! Steps (orchestrated from `commands::deploy::cmd_deploy_subcommand`):
+//!   1. Resolve the default KMS contract or validate the explicit override
+//!      against `GET /kms-roots`, before any image build or CVM creation.
 //!   2. Auth preflight (`GET /miners/me`) — fail fast if the operator
-//!      forgot `gmcli login` or has a stale token, before any CVM work.
+//!      forgot `gmcli login` or has a stale token. Check the CVM name is free,
+//!      accept terms, and require provider API keys before any image build.
 //!   3. Fetch the approved `ImageVersion` list from the registry.
 //!   4. Select this CLI release's supported image (or a pinned one if `--version`
 //!      given).
@@ -40,26 +41,28 @@ use anyhow::Result;
 mod compose;
 mod cvm;
 mod hashes;
+mod kms_roots;
 mod registry_auth;
 mod version;
 
 pub use compose::{render_compose, render_env_file, COMPOSE_TEMPLATE, PRELAUNCH_SCRIPT};
 pub use cvm::{
-    build_phala_deploy_args, parse_phala_cvm_app_id, parse_phala_cvm_detail,
-    parse_phala_cvm_endpoint, parse_phala_cvm_name, phala_command, preflight_phala_cli,
-    to_ratls_passthrough_endpoint, PhalaClient, PhalaDeployArgs, RealPhalaClient,
-    PHALA_APP_ID_FIELD, PHALA_COMPOSE_HASH_FIELD, PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD,
-    POLL_INTERVAL_SECS,
+    build_phala_deploy_args, delete_phala_cvm, parse_phala_cvm_app_id, parse_phala_cvm_delete,
+    parse_phala_cvm_detail, parse_phala_cvm_endpoint, parse_phala_cvm_name, phala_command,
+    phala_output, to_ratls_passthrough_endpoint, CvmDeletion, PhalaClient, PhalaCommand,
+    PhalaDeployArgs, RealPhalaClient, PHALA_APP_ID_FIELD, PHALA_COMPOSE_HASH_FIELD,
+    PHALA_ENDPOINT_FIELD, PHALA_OS_IMAGE_HASH_FIELD, POLL_INTERVAL_SECS,
 };
 pub use hashes::{normalize_hash, verify_hashes, DeployOutcome, DstackDeployResult};
+pub use kms_roots::resolve_kms_contract_id;
 pub use registry_auth::{
     fetch_anonymous_token, image_is_public, non_empty_env, parse_bearer_challenge, registry_host,
     resolve_registry_credentials, split_repo_reference, visibility_from_status, BearerChallenge,
     RegistryCredentials, Visibility, GHCR_PULL_TOKEN_VAR, GHCR_PULL_USERNAME_VAR,
 };
 pub use version::{
-    fetch_supported_versions, format_created_at, resolve_image_source, select_version, ImageSource,
-    ImageVersion, ImageVersionOut, ImageVersionsResponse,
+    fetch_all_versions, fetch_supported_versions, format_created_at, resolve_image_source,
+    select_version, ImageSource, ImageVersion, ImageVersionOut, ImageVersionsResponse,
 };
 
 /// Default maximum time to wait for hashes to appear after deploy (seconds).
@@ -68,11 +71,11 @@ pub const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
 /// Default OS image passed to `phala deploy --image`.
 ///
 /// The OS image version must match the dstack version of the Phala node
-/// the CVM lands on. Confirmed via `phala cvms list-nodes` (2026-10-14):
-/// prod5/prod9 dropped `dstack-0.5.9` and now offer `dstack-0.5.8`,
-/// `dstack-0.5.12` and `dstack-0.6.1`; `dstack-0.5.12` is the newest 0.5.x,
-/// so it's the working default.
-pub const DEFAULT_OS_IMAGE: &str = "dstack-0.5.12";
+/// the CVM lands on. Confirmed via `phala cvms list-nodes` (2026-11-19):
+/// prod5/prod9 dropped `dstack-0.5.12` and now offer `dstack-0.5.14`,
+/// `dstack-0.5.15`, `dstack-0.6.4` and `dstack-0.6.5`; `dstack-0.5.15` is the
+/// newest 0.5.x, so it's the working default.
+pub const DEFAULT_OS_IMAGE: &str = "dstack-0.5.15";
 
 /// Abstraction over the image-build step, injectable so the deploy
 /// orchestration can be exercised without a real `docker` toolchain.

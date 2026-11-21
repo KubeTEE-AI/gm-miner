@@ -53,7 +53,14 @@ jobs:
 
       - name: Clippy
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # The local CoCo dependency is built and tested with the consumer.
+        # Its pinned source intentionally does not inherit newer Clippy style
+        # lints, as documented in attestd/vendor/VENDORED-SEV.md.
+        run: |
+          set -euo pipefail
+          for package in gmcli gm-miner-attestd gm-azure-verify; do
+            cargo clippy -p "$package" --no-deps --all-targets --all-features -- -D warnings
+          done
 
       - name: Build
         env:

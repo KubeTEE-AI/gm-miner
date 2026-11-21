@@ -19,8 +19,8 @@
 //!   sources          — list sourcing routes with capability vs admission status
 //!   update           — upgrade gmcli in place to the latest release
 //!   worker add       — attach a new data-plane CVM under the existing hotkey
-//!   worker list      — list the hotkey's live workers
-//!   worker remove    — deregister a worker (CVM teardown is separate)
+//!   worker list      — list the hotkey's live workers and the image version each runs
+//!   worker remove    — deregister a worker and delete its Phala CVM (`--keep-cvm` keeps it)
 //!
 //! Every command resolves a [`Network`] profile (testnet/mainnet) carrying the
 //! subnet `netuid`, chain websocket, and default registry URL. The selection
@@ -58,7 +58,8 @@ use gm_miner_cli::{
 
 use crate::commands::deploy::{
     cmd_deploy_subcommand, cmd_publish_image_version, cmd_register_image_subcommand,
-    cmd_worker_add, cmd_worker_list, cmd_worker_remove, deploy_args_from_flags, WorkerRegistration,
+    cmd_worker_add, cmd_worker_list, cmd_worker_remove, deploy_args_from_flags, CvmTeardown,
+    WorkerRegistration,
 };
 use crate::commands::doctor::cmd_doctor;
 use crate::commands::earnings::cmd_earnings;
@@ -182,8 +183,7 @@ enum Command {
     /// measured hashes match the registry approval, then registers the
     /// image automatically.
     ///
-    /// Phala Cloud manages the confidential VM, the KMS, and `app_id`
-    /// authorization. Authentication uses a Phala Cloud API key — set
+    /// Authentication uses a Phala Cloud API key — set
     /// `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY`, pass `--phala-api-key`, or
     /// run `phala auth login` before deploying.
     #[command(after_help = "Examples:\n  \
@@ -668,6 +668,15 @@ pub(crate) struct DeployFlags {
     #[arg(long, env = "PHALA_DISK_SIZE", default_value = "40G")]
     pub(crate) disk_size: String,
 
+    /// Phala KMS contract ID for a new CVM. Defaults to the registry's
+    /// default allowed root; explicit IDs must name a non-expiring allowed root.
+    #[arg(
+        long,
+        value_name = "ID",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub(crate) kms_contract_id: Option<String>,
+
     /// Repository root used as the Docker build context. Defaults to
     /// the current directory.
     #[arg(long)]
@@ -743,17 +752,45 @@ enum WorkerCommand {
     /// List the hotkey's live workers with per-worker status and last
     /// attestation (`GET /miners/{hotkey}/workers`).
     ///
+    /// Each worker's image is named by matching its compose hash against
+    /// `GET /image-versions`: the release tag and whether it is supported,
+    /// deprecated (with the epoch its grace ends) or revoked. If that lookup
+    /// fails the list still prints, showing the short compose hash.
+    ///
     /// A suspended worker also reports when it is re-probed next and how many
     /// consecutive successful probes restore it; a worker whose upstream key
     /// failed to verify names the failing slot.
     List,
 
     /// Deregister a worker from the registry (`DELETE
-    /// /miners/{hotkey}/workers/{worker_id}`). This does NOT tear down the
-    /// Phala CVM — `phala cvms delete <app_id>` separately.
+    /// /miners/{hotkey}/workers/{worker_id}`), drop its local record, then
+    /// delete its Phala CVM (`phala cvms delete <app_id>`).
+    ///
+    /// Before anything changes, gmcli checks that the `phala` CLI is installed
+    /// and Phala Cloud accepts the credential via `phala whoami` (skipped with
+    /// `--keep-cvm`). The
+    /// CVM is deleted only after the registry DELETE succeeds. If the CVM
+    /// cannot be deleted, or its `app_id` is not tracked locally, the command
+    /// says so, prints the `phala cvms delete` to run, and exits non-zero.
     Remove {
-        /// The registry `worker_id` (ULID) of the worker to remove.
+        /// The registry `worker_id` (ULID) of the worker to remove, or the
+        /// `app_id` / `app_name` of a provisional (never registered) worker.
         worker_id: String,
+
+        /// Keep the worker's Phala CVM running; only deregister it.
+        #[arg(long)]
+        keep_cvm: bool,
+
+        /// Phala Cloud API key for the CVM delete (this run only, not
+        /// persisted). When omitted, gmcli uses `PHALA_API_KEY` /
+        /// `PHALA_CLOUD_API_KEY`, then the key saved in config, then the
+        /// `phala` CLI login session.
+        #[arg(
+            long = "phala-api-key",
+            value_name = "KEY",
+            conflicts_with = "keep_cvm"
+        )]
+        phala_api_key: Option<String>,
     },
 }
 
@@ -1025,7 +1062,22 @@ async fn dispatch_worker(
     match command {
         WorkerCommand::Add { flags } => cmd_worker_add(cfg, deploy_args_from_flags(*flags)).await,
         WorkerCommand::List => cmd_worker_list(&mut RegistryClient::new(cfg)).await,
-        WorkerCommand::Remove { worker_id } => cmd_worker_remove(cfg, &worker_id).await,
+        WorkerCommand::Remove {
+            worker_id,
+            keep_cvm,
+            phala_api_key,
+        } => {
+            let cvm = if keep_cvm {
+                CvmTeardown::Keep
+            } else {
+                let phala_api_key = gm_miner_cli::phala::non_interactive_key(
+                    phala_api_key.as_deref(),
+                    cfg.phala_api_key.as_deref(),
+                );
+                CvmTeardown::Delete { phala_api_key }
+            };
+            cmd_worker_remove(cfg, &worker_id, cvm).await
+        }
     }
 }
 
@@ -1148,18 +1200,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1204,18 +1246,8 @@ mod tests {
         // surface as a different error than the one asserted here.
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-1"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1270,18 +1302,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1328,18 +1350,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-1".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-1"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1348,6 +1360,11 @@ mod tests {
         assert!(
             err.to_string().contains("in-flight worker #1"),
             "must redirect to deploy; got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("`gmcli worker remove gm-miner-1 --keep-cvm` to discard the stub"),
+            "the stub has no app_id, so the discard path must not end in an error: {err}"
         );
     }
 
@@ -1383,18 +1400,8 @@ mod tests {
         };
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let err = cmd_worker_add(cfg, args)
@@ -1402,7 +1409,9 @@ mod tests {
             .expect_err("a provisional CVM must block a re-deploy");
         let msg = err.to_string();
         assert!(
-            msg.contains("app_orphan") && msg.contains("phala cvms delete"),
+            msg.contains("app_orphan")
+                && msg.contains("gmcli worker remove")
+                && msg.contains("deletes that CVM"),
             "must name the orphaned CVM and how to tear it down; got: {msg}"
         );
     }
@@ -1497,6 +1506,17 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
+            .and(path("/kms-roots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "roots": [{
+                    "kms_contract_id": "registry-default",
+                    "allowed_until": null,
+                    "is_default": true,
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/miners/me"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "hotkey": "5HK",
@@ -1573,6 +1593,7 @@ mod tests {
         impl PhalaClient for NoDeploy {
             fn deploy(
                 &self,
+                _kms_contract_id: &str,
                 _: &str,
                 _: &ProviderKeys,
                 _: &str,
@@ -1597,6 +1618,18 @@ mod tests {
         ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
+                .and(path("/kms-roots"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "roots": [{
+                        "kms_contract_id": "registry-default",
+                        "allowed_until": null,
+                        "is_default": true,
+                    }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
                 .and(path("/image-versions"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "versions": [{
@@ -1616,18 +1649,10 @@ mod tests {
             });
             let args = DeployArgs {
                 app_name: "new-worker".to_owned(),
-                image_ref: None,
                 project_dir: std::path::PathBuf::from("unused"),
-                image_repo: None,
                 image_tag: "unused".to_owned(),
-                instance_type: "tdx.medium".to_owned(),
-                disk_size: "40G".to_owned(),
-                repo_root: None,
                 version: pin,
-                boot_timeout_secs: 300,
-                phala_api_key: None,
-                assume_yes: false,
-                accept_terms: false,
+                ..crate::commands::deploy::default_test_deploy_args()
             };
             let mut client = RegistryClient::new(cfg.clone());
             let error = cmd_deploy(
@@ -1665,6 +1690,7 @@ mod tests {
         impl PhalaClient for UnusedPhala {
             fn deploy(
                 &self,
+                _kms_contract_id: &str,
                 _compose: &str,
                 _keys: &ProviderKeys,
                 _node_secret: &str,
@@ -1695,18 +1721,8 @@ mod tests {
 
         let args = DeployArgs {
             app_name: "gm-miner-2".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("dist/gm-miner-2"),
-            image_repo: None,
-            image_tag: "v0.1.0".to_owned(),
-            instance_type: "tdx.medium".to_owned(),
-            disk_size: "40G".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
-            assume_yes: false,
-            accept_terms: false,
+            ..crate::commands::deploy::default_test_deploy_args()
         };
 
         let mut client = RegistryClient::new(cfg.clone());
@@ -2069,6 +2085,37 @@ mod tests {
     }
 
     #[test]
+    fn clap_leaves_the_kms_contract_unset_by_default() {
+        let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "deploy"]).unwrap();
+        let Command::Deploy { flags } = cli.command else {
+            unreachable!("expected deploy");
+        };
+        assert_eq!(flags.kms_contract_id, None);
+    }
+
+    #[test]
+    fn clap_parses_an_explicit_kms_contract_id() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "deploy",
+            "--kms-contract-id",
+            "registry-root-id",
+        ])
+        .unwrap();
+        let Command::Deploy { flags } = cli.command else {
+            unreachable!("expected deploy");
+        };
+        assert_eq!(flags.kms_contract_id.as_deref(), Some("registry-root-id"));
+    }
+
+    #[test]
+    fn clap_rejects_empty_kms_contract_overrides() {
+        let result =
+            <Cli as clap::Parser>::try_parse_from(["gmcli", "deploy", "--kms-contract-id", ""]);
+        assert!(result.is_err(), "deploy accepted an empty KMS contract");
+    }
+
+    #[test]
     fn clap_parses_worker_list() {
         let cli = <Cli as clap::Parser>::try_parse_from(["gmcli", "worker", "list"]).unwrap();
         assert!(matches!(
@@ -2084,12 +2131,55 @@ mod tests {
         let cli =
             <Cli as clap::Parser>::try_parse_from(["gmcli", "worker", "remove", "01J0C"]).unwrap();
         let Command::Worker {
-            command: WorkerCommand::Remove { worker_id },
+            command:
+                WorkerCommand::Remove {
+                    worker_id,
+                    keep_cvm,
+                    phala_api_key,
+                },
         } = cli.command
         else {
             unreachable!("expected worker remove");
         };
         assert_eq!(worker_id, "01J0C");
+        assert!(!keep_cvm, "the CVM is deleted unless --keep-cvm is passed");
+        assert_eq!(phala_api_key, None);
+    }
+
+    #[test]
+    fn clap_parses_worker_remove_keep_cvm() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "worker",
+            "remove",
+            "01J0C",
+            "--keep-cvm",
+        ])
+        .unwrap();
+        let Command::Worker {
+            command: WorkerCommand::Remove { keep_cvm, .. },
+        } = cli.command
+        else {
+            unreachable!("expected worker remove");
+        };
+        assert!(keep_cvm);
+    }
+
+    #[test]
+    fn clap_rejects_a_phala_key_alongside_keep_cvm() {
+        let result = <Cli as clap::Parser>::try_parse_from([
+            "gmcli",
+            "worker",
+            "remove",
+            "01J0C",
+            "--keep-cvm",
+            "--phala-api-key",
+            "k",
+        ]);
+        assert!(
+            result.is_err(),
+            "a key for a delete that will not run is a mistake"
+        );
     }
 
     #[test]

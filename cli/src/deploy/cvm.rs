@@ -1,7 +1,9 @@
-//! Phala Cloud CVM orchestration: `phala deploy` + `phala cvms get` wiring.
+//! Phala Cloud CVM orchestration: `phala deploy`, `phala cvms get` and
+//! `phala cvms delete` wiring.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::ops::{Deref, DerefMut};
 
 use crate::config::ProviderKeys;
 use crate::deploy::compose::{write_env_file, PRELAUNCH_SCRIPT};
@@ -29,12 +31,15 @@ pub trait PhalaClient {
     /// same encrypted env so the CVM's pre-launch script can `docker login`
     /// and pull the (private) miner image. `boot_timeout_secs` controls
     /// how long to poll for the measured hashes before giving up.
+    /// `kms_contract_id` comes from the registry's default or a validated
+    /// explicit override.
     ///
     /// # Errors
     /// Returns an error if the deploy fails or the hashes/endpoint cannot
     /// be read back within `boot_timeout_secs`.
     fn deploy(
         &self,
+        kms_contract_id: &str,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
         node_secret: &str,
@@ -106,16 +111,67 @@ impl RealPhalaClient {
     }
 }
 
-/// Build a `phala` command with the API key scoped onto it (via `.env`),
-/// never the global process environment — so the secret reaches only the
-/// `phala` CLI, not the `git`/`docker` subprocesses of the image build.
-#[must_use]
-pub fn phala_command(api_key: Option<&str>) -> std::process::Command {
+/// A `phala` command that owns its isolated process working directory for the
+/// full lifetime of the subprocess.
+pub struct PhalaCommand {
+    command: std::process::Command,
+    _working_dir: tempfile::TempDir,
+}
+
+impl Deref for PhalaCommand {
+    type Target = std::process::Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for PhalaCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+/// Build a `phala` command with an isolated working directory and the API key
+/// scoped onto it (via `.env`), never the global process environment — so the
+/// secret reaches only the `phala` CLI, not the `git`/`docker` subprocesses of
+/// the image build. The private, newly-created working directory keeps an
+/// ambient caller `phala.toml` out of every Phala invocation. A relative
+/// `PHALA_CLOUD_DIR` and relative PATH entries still resolve from the caller's
+/// directory.
+///
+/// # Errors
+/// Returns an error if gmcli cannot create the isolated working directory or
+/// resolve the credential directory or executable search path.
+pub fn phala_command(api_key: Option<&str>) -> Result<PhalaCommand> {
+    let working_dir = tempfile::tempdir().context("create isolated Phala CLI working directory")?;
     let mut cmd = std::process::Command::new("phala");
+    crate::dependency::scope_search_path(&mut cmd)?;
+    crate::phala::scope_credentials_dir(&mut cmd)?;
+    cmd.current_dir(working_dir.path());
     if let Some(key) = api_key {
         cmd.env("PHALA_CLOUD_API_KEY", key);
     }
-    cmd
+    Ok(PhalaCommand {
+        command: cmd,
+        _working_dir: working_dir,
+    })
+}
+
+/// Run a Phala CLI command and add the shared install hint if it cannot spawn.
+///
+/// # Errors
+/// Returns an error if the subprocess cannot be started.
+pub fn phala_output(
+    command: &mut std::process::Command,
+    invocation: &str,
+) -> Result<std::process::Output> {
+    command.output().with_context(|| {
+        format!(
+            "{invocation} — is the Phala CLI installed? ({})",
+            crate::dependency::PHALA.installer.display
+        )
+    })
 }
 
 /// The CVM detail document returned by `phala cvms get <cvm-id> --json`.
@@ -471,6 +527,7 @@ pub struct PhalaDeployArgs<'a> {
     pub disk_size: &'a str,
     /// Production OS image (`--image`).
     pub os_image: &'a str,
+    pub kms_contract_id: &'a str,
     /// Rendered compose file path (`--compose`).
     pub compose_path: &'a str,
     /// Env file path (`--env`).
@@ -485,7 +542,8 @@ pub struct PhalaDeployArgs<'a> {
 /// provisions the `TEEPod`, runs the KMS, encrypts the env file client-side
 /// to the CVM key, and assigns the `app_id`. The flags pin the CVM name,
 /// instance type, disk size, compose file, env file, and the corrected
-/// pre-launch script, request a production OS image (`--image` plus
+/// pre-launch script, select Phala KMS and its contract for the new CVM,
+/// request a production OS image (`--image` plus
 /// `--no-dev-os` — never a `dstack-dev-*` image for an attested miner),
 /// and request JSON output plus `--wait` so the call returns only once the
 /// CVM is up. The deployed CVM's identity is *not* scraped from
@@ -508,6 +566,10 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
         "--image".to_owned(),
         args.os_image.to_owned(),
         "--no-dev-os".to_owned(),
+        "--kms".to_owned(),
+        "phala".to_owned(),
+        "--kms-contract-id".to_owned(),
+        args.kms_contract_id.to_owned(),
         "--compose".to_owned(),
         args.compose_path.to_owned(),
         "--env".to_owned(),
@@ -534,10 +596,9 @@ pub fn build_phala_deploy_args(args: &PhalaDeployArgs<'_>) -> Vec<String> {
 /// Returns an error only if `phala` cannot be spawned, or it exits
 /// successfully but emits output that is not valid `cvms get --json` JSON.
 fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<DeployOutcome>> {
-    let out = phala_command(api_key)
-        .args(["cvms", "get", cvm_id, "--json"])
-        .output()
-        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
+    let mut command = phala_command(api_key)?;
+    command.args(["cvms", "get", cvm_id, "--json"]);
+    let out = phala_output(&mut command, "run phala cvms get")?;
 
     if !out.status.success() {
         tracing::info!(
@@ -567,6 +628,78 @@ fn read_phala_cvm_outcome(cvm_id: &str, api_key: Option<&str>) -> Result<Option<
     }))
 }
 
+/// What `phala cvms delete` did to a CVM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CvmDeletion {
+    /// Phala Cloud deleted the CVM.
+    Deleted,
+    /// Phala Cloud has no such CVM in the workspace the credential can see:
+    /// it was already deleted, or it lives under a different Phala account.
+    NotFound,
+}
+
+/// The `{"success": false, "error": "..."}` envelope `phala ... --json` prints
+/// on stdout when a command fails.
+#[derive(Debug, Deserialize)]
+struct PhalaFailure {
+    error: Option<String>,
+}
+
+/// Delete the CVM `app_id` with `phala cvms delete <app_id> --force --json`,
+/// using the same isolated `phala` subprocess and API-key scoping as deploy.
+///
+/// # Errors
+/// Returns an error if `phala` cannot be spawned or Phala Cloud refuses the
+/// delete for any reason other than the CVM not existing.
+pub fn delete_phala_cvm(app_id: &str, api_key: Option<&str>) -> Result<CvmDeletion> {
+    let mut command = phala_command(api_key)?;
+    command.args(["cvms", "delete", app_id, "--force", "--json"]);
+    let out = phala_output(&mut command, "run phala cvms delete")?;
+    parse_phala_cvm_delete(out.status.success(), &out.stdout, &out.stderr)
+        .map_err(|err| anyhow::anyhow!(crate::phala::redact_credentials(&err.to_string(), api_key)))
+}
+
+/// The exact errors `phala cvms delete --json` reports for a CVM that does not
+/// exist: the API's lookup answer, and the CLI's own when the lookup is empty.
+/// Compared whole (trimmed, case-insensitive) so an unrelated failure that
+/// merely mentions "not found" stays an error.
+const PHALA_CVM_NOT_FOUND_ERRORS: [&str; 2] = ["the requested cvm was not found", "cvm not found"];
+
+/// Classify a `phala cvms delete --json` run. A zero exit is a deletion. A
+/// failure whose error is exactly one of [`PHALA_CVM_NOT_FOUND_ERRORS`] is
+/// [`CvmDeletion::NotFound`]. Any other failure is an error carrying Phala's
+/// own message.
+///
+/// # Errors
+/// Returns an error for every non-zero exit that is not a not-found.
+pub fn parse_phala_cvm_delete(
+    succeeded: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<CvmDeletion> {
+    if succeeded {
+        return Ok(CvmDeletion::Deleted);
+    }
+    let reported = serde_json::from_slice::<PhalaFailure>(stdout)
+        .ok()
+        .and_then(|failure| failure.error)
+        .filter(|error| !error.trim().is_empty());
+    if let Some(error) = &reported {
+        if PHALA_CVM_NOT_FOUND_ERRORS.contains(&error.trim().to_ascii_lowercase().as_str()) {
+            return Ok(CvmDeletion::NotFound);
+        }
+    }
+    let detail = reported.unwrap_or_else(|| {
+        let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+        if stderr.is_empty() {
+            String::from_utf8_lossy(stdout).trim().to_owned()
+        } else {
+            stderr
+        }
+    });
+    bail!("phala cvms delete failed: {detail}")
+}
+
 /// Run one paginated `phala cvms list --json` request and parse its collision
 /// lookup result. A non-zero exit is an error because an unreadable page cannot
 /// establish that the requested CVM name is free.
@@ -576,10 +709,9 @@ fn read_phala_cvm_list_page(
     api_key: Option<&str>,
 ) -> Result<PhalaCvmListPage> {
     let args = build_phala_cvm_list_args(page);
-    let out = phala_command(api_key)
-        .args(&args)
-        .output()
-        .context("run phala cvms list — is the phala CLI installed? (npm i -g phala)")?;
+    let mut command = phala_command(api_key)?;
+    command.args(&args);
+    let out = phala_output(&mut command, "run phala cvms list")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!(
@@ -595,6 +727,7 @@ fn read_phala_cvm_list_page(
 impl PhalaClient for RealPhalaClient {
     fn deploy(
         &self,
+        kms_contract_id: &str,
         compose_yaml: &str,
         env_vars: &ProviderKeys,
         node_secret: &str,
@@ -605,23 +738,25 @@ impl PhalaClient for RealPhalaClient {
 
         fs::create_dir_all(&self.project_dir)
             .with_context(|| format!("create project dir {}", self.project_dir.display()))?;
+        let project_dir = fs::canonicalize(&self.project_dir)
+            .with_context(|| format!("resolve project dir {}", self.project_dir.display()))?;
 
         // Write the rendered compose file.
-        let compose_path = self.project_dir.join("docker-compose.yaml");
+        let compose_path = project_dir.join("docker-compose.yaml");
         fs::write(&compose_path, compose_yaml)
             .with_context(|| format!("write {}", compose_path.display()))?;
 
         // Write the corrected, digest-aware pre-launch script. Phala
         // Cloud's auto-injected v0.0.14 script mis-parses digest-pinned
         // image refs; this bundled copy fixes that.
-        let prelaunch_path = self.project_dir.join("prelaunch.sh");
+        let prelaunch_path = project_dir.join("prelaunch.sh");
         fs::write(&prelaunch_path, PRELAUNCH_SCRIPT)
             .with_context(|| format!("write {}", prelaunch_path.display()))?;
 
         // Write the env file at mode 0600 so the secrets are never visible
         // with broader permissions. `phala deploy` reads this file and
         // encrypts its contents client-side to the CVM key.
-        let env_path = self.project_dir.join(".env");
+        let env_path = project_dir.join(".env");
         write_env_file(&env_path, env_vars, node_secret, registry_creds)?;
 
         let compose_arg = compose_path.to_string_lossy().into_owned();
@@ -632,15 +767,15 @@ impl PhalaClient for RealPhalaClient {
             instance_type: &self.instance_type,
             disk_size: &self.disk_size,
             os_image: &self.os_image,
+            kms_contract_id,
             compose_path: &compose_arg,
             env_path: &env_arg,
             prelaunch_path: &prelaunch_arg,
         });
 
-        let out = phala_command(self.api_key.as_deref())
-            .args(&args)
-            .output()
-            .context("run phala deploy — is the phala CLI installed? (npm i -g phala)")?;
+        let mut command = phala_command(self.api_key.as_deref())?;
+        command.args(&args);
+        let out = phala_output(&mut command, "run phala deploy")?;
         if !out.status.success() {
             bail!(
                 "phala deploy exited with status {}: {}",
@@ -711,31 +846,6 @@ fn poll_phala_cvm_outcome(
     }
 }
 
-/// Preflight that the `phala` CLI is on `PATH`.
-///
-/// `phala` is the runtime dependency of `gmcli deploy`: it submits the
-/// compose stack to Phala Cloud and reports the measured CVM hashes. A
-/// missing CLI is caught here with an actionable install hint before any
-/// image build runs.
-///
-/// # Errors
-/// Returns an error if `phala` is not on `PATH`.
-pub fn preflight_phala_cli() -> Result<()> {
-    let on_path = std::process::Command::new("phala")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !on_path {
-        bail!(
-            "the `phala` CLI is required for `gmcli deploy` but was not found on PATH.\n  \
-             install it with: npm i -g phala"
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -751,7 +861,7 @@ mod tests {
     /// omitted entirely when there is none (CLI-session auth).
     #[test]
     fn phala_command_scopes_the_api_key_onto_the_subprocess() {
-        let cmd = phala_command(Some("secret-key"));
+        let cmd = phala_command(Some("secret-key")).expect("isolated Phala command");
         let scoped: Vec<_> = cmd
             .get_envs()
             .filter(|(k, _)| *k == std::ffi::OsStr::new("PHALA_CLOUD_API_KEY"))
@@ -763,7 +873,7 @@ mod tests {
             "the scoped value must be the resolved key"
         );
 
-        let no_key = phala_command(None);
+        let no_key = phala_command(None).expect("isolated Phala command");
         assert!(
             no_key
                 .get_envs()
@@ -788,6 +898,7 @@ mod tests {
             instance_type: "tdx.medium",
             disk_size: "40G",
             os_image: "dstack-0.5.7",
+            kms_contract_id: "registry-selected-contract",
             compose_path: "/tmp/dist/docker-compose.yaml",
             env_path: "/tmp/dist/.env",
             prelaunch_path: "/tmp/dist/prelaunch.sh",
@@ -808,6 +919,8 @@ mod tests {
             ("--instance-type", "tdx.medium"),
             ("--disk-size", "40G"),
             ("--image", "dstack-0.5.7"),
+            ("--kms", "phala"),
+            ("--kms-contract-id", "registry-selected-contract"),
             ("--compose", "/tmp/dist/docker-compose.yaml"),
             ("--env", "/tmp/dist/.env"),
             ("--pre-launch-script", "/tmp/dist/prelaunch.sh"),
@@ -1277,5 +1390,47 @@ mod tests {
         assert_eq!(PHALA_COMPOSE_HASH_FIELD, "compose_hash");
         assert_eq!(PHALA_OS_IMAGE_HASH_FIELD, "os.os_image_hash");
         assert_eq!(PHALA_ENDPOINT_FIELD, "endpoints[0].app");
+    }
+
+    // ── phala cvms delete classification ──────────────────────────────────────
+
+    #[test]
+    fn a_zero_exit_delete_is_a_deletion() {
+        let stdout = br#"{"success":true,"data":{"deleted":true,"cvm":"gm-miner-2"}}"#;
+        assert_eq!(
+            parse_phala_cvm_delete(true, stdout, b"").expect("deleted"),
+            CvmDeletion::Deleted
+        );
+    }
+
+    /// Both not-found wordings: the API's (verified against `phala` 1.1.19)
+    /// and the CLI's own when the lookup returns nothing.
+    #[test]
+    fn a_not_found_failure_is_not_an_error() {
+        for stdout in [
+            br#"{"success":false,"error":"The requested CVM was not found"}"#.as_slice(),
+            br#"{"success":false,"error":"CVM not found"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                parse_phala_cvm_delete(false, stdout, b"").expect("not found is classified"),
+                CvmDeletion::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_failure_is_an_error_carrying_phalas_message() {
+        let stdout = br#"{"success":false,"error":"Invalid API key"}"#;
+        let err = parse_phala_cvm_delete(false, stdout, b"").expect_err("must fail");
+        assert!(err.to_string().contains("Invalid API key"), "{err}");
+
+        let stdout = br#"{"success":false,"error":"Workspace not found"}"#;
+        let err = parse_phala_cvm_delete(false, stdout, b"")
+            .expect_err("an unrelated not-found must not read as an absent CVM");
+        assert!(err.to_string().contains("Workspace not found"), "{err}");
+
+        let err = parse_phala_cvm_delete(false, b"", b"network unreachable\n")
+            .expect_err("a failure without JSON must still fail");
+        assert!(err.to_string().contains("network unreachable"), "{err}");
     }
 }

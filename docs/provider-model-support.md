@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-10-30**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-11-04**. This is a miner setup matrix, not a buyer product
 catalog. It distinguishes transport capability from registry admission:
 
 * A direct/API-key source is declarable when the registry publishes the route
@@ -23,9 +23,45 @@ catalog. It distinguishes transport capability from registry admission:
   Unadmitted models remain unavailable. A known model id or successful
   HTTP probe is not sufficient.
 
-Bedrock bindings refresh every 60 seconds and expire 120 seconds after the last
-successful refresh. Failed refreshes do not extend validity. The adapter rechecks
-the current binding after reading the request body and immediately before dispatch.
+The adapter keeps its 20 MiB body limit and requires a strict duplicate-key-free
+top-level JSON object, a valid bound `model`, and boolean `stream` when present.
+It rewrites only `model` and leaves every other body field and content block to
+Bedrock's validation. It checks the gateway execution policy, binding revision,
+JSON content type, and Anthropic version. It forwards one optional
+`anthropic-beta` value unchanged when it is a visible-ASCII comma-separated
+HTTP-token list of at most 1024 bytes. Malformed, repeated, or overlong values
+receive the standard 400 Header reject. The adapter has no beta-name allowlist;
+Bedrock decides which beta values a model supports. Other buyer headers are
+ignored and never forwarded. The upstream request uses the worker's configured
+Bedrock credential.
+
+Unknown response fields, content blocks, deltas, and SSE event types pass through.
+The adapter still validates the raw model identity before releasing content and
+enforces SSE framing, size bounds, and message start/termination ordering. Unknown
+events before `message_start` are buffered until identity is verified; malformed
+frames and known events in the wrong order are rejected immediately.
+
+The gateway protocol, image feature, and binding revisions are unchanged. Gateways
+that send the required execution policy and binding revision can use the updated
+miner; gateways that omit either header still receive a 400. Older miners retain
+their request restrictions, so newly accepted body fields and beta headers can
+still receive 400s during a mixed-image rollout.
+
+After a successful refresh, Bedrock bindings are fetched again in 60 seconds. A
+last-known-good snapshot remains valid for 15 minutes after its successful
+fetch. Failed refreshes retry with jittered exponential backoff but do not extend
+the snapshot's validity. The 15-second fetch timeout and maximum retry delay fit
+within the 60-second cadence. A missing snapshot, absent model, or newer requested
+row revision requests a shared refresh. Requests join an in-flight fetch and
+re-check once after it finishes, bounded by its 15-second timeout. During the
+three-second post-success gap, a request waits out the remaining gap, then joins
+the shared fetch at the gap's end; its total wait is bounded by the gap remainder
+plus the fetch timeout. During failure backoff, requests immediately re-check
+the current snapshot and return the existing reject if it still does not match.
+Lower revisions receive an immediate 409 without a fetch, even after snapshot
+expiry.
+The adapter rechecks the current binding after reading the request body and
+immediately before dispatch.
 Requests already dispatched finish against the binding captured for that request;
 a later mapping change does not replay or retarget them.
 
@@ -108,22 +144,19 @@ their presence here does not establish registry admission.
 | `GPT-6.1 Terra` | OpenAI API: `openai/gpt-6.1-terra` (`--openai`); Azure OpenAI: ARM-verified transport |
 | `gpt-oss-20b` | DeepInfra: `deepinfra/openai/gpt-oss-20b` (`--deepinfra`); chat completions only |
 | `Kimi K2.6 TEE` | Chutes: `chutes/moonshotai/Kimi-K2.6-TEE` (`--chutes`) |
-| `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
-| `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`) |
-| `Kimi K3.1 Pro` | Moonshot API: `moonshot/kimi-k3.1-pro` (`--moonshot`) |
+| `Kimi K3` | Moonshot API: `moonshot/kimi-k3` (`--moonshot`); DeepInfra: `deepinfra/moonshotai/Kimi-K3` (`--deepinfra`); Engy: `engy/kimi-k3` (`--engy`); Moonmath ZRO: `moonmath/kimi-k3` (`--moonmath`); Chutes (TEE sibling): `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`); KubeTEE (TEE sibling): `kubetee/moonshotai/kimi-k3` (`--kubetee`) |
+| `Kimi K3 TEE` | Chutes: `chutes/moonshotai/Kimi-K3-TEE` (`--chutes`); KubeTEE: `kubetee/moonshotai/kimi-k3` (`--kubetee`) |
+| `Kimi K3.1 Pro` | Moonshot API: `moonshot/kimi-k3.1-pro` (`--moonshot`); Engy: `engy/kimi-k3.1-pro` (`--engy`); KubeTEE (TEE sibling): `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
+| `Kimi K3.1 Pro TEE` | KubeTEE: `kubetee/moonshotai/kimi-k3.1-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed` | KubeTEE (TEE sibling): `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
 | `MiMo V2.6 Pro Ultraspeed TEE` | KubeTEE: `kubetee/xiaomi/mimo-v2.6-pro` (`--kubetee`) |
-| `MiniMax H3` | Engy: `engy/MiniMax-H3` (`--engy`, native async video API); KubeTEE (**disabled in catalog**): `kubetee/minimax/h3` (`--kubetee`) |
-| `Mistral Large 4` | KubeTEE (TEE sibling): `kubetee/mistralai/mistral-large-4` (`--kubetee`) |
-| `Mistral Large 4 TEE` | KubeTEE: `kubetee/mistralai/mistral-large-4` (`--kubetee`) |
+| `MiniMax H3` | Engy: `engy/MiniMax-H3` (`--engy`, native async video API) |
 | `Mistral Nemo Instruct 2407 TEE` | Chutes: `chutes/unsloth/Mistral-Nemo-Instruct-2407-TEE` (`--chutes`) |
 | `Nano Banana 2.1` | Google native `generateContent`: `gemini/gemini-nano-banana-2.1` (`--google`) |
 | `Nano Banana Pro` | Google native `generateContent`: `gemini/gemini-3-pro-image` (`--google`) |
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
 | `o3` | OpenAI API: `openai/o3` (`--openai`); Azure OpenAI: ARM-verified transport |
 | `o4-mini` | OpenAI API: `openai/o4-mini` (`--openai`); Azure OpenAI: ARM-verified transport |
-| `Ornith 1.5 397B` | KubeTEE (TEE sibling): `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
-| `Ornith 1.5 397B TEE` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |

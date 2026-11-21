@@ -57,18 +57,20 @@ explains the table and how to set each upstream up.
 | `zai/glm-5.2-tee` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-flash-tee` | `kubetee/z-ai/glm-5.3-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `zai/glm-5.3-tee` | `kubetee/z-ai/glm-5.3` | `llm.kubetee.ai` | `--kubetee` |
-| `minimax/h3` | `kubetee/minimax/h3` | `llm.kubetee.ai` | `--kubetee` |
+| `minimax/h3` | `kubetee/minimax/h3` | retired by KubeTEE (2026-11-03) | `--kubetee` |
 | `minimax/h3` | `engy/MiniMax-H3` | `api.engy.ai` (`/v2/video_generation`) | `--engy` |
 | `qwen/qwen3.8-flash-next` | `kubetee/qwen/qwen3.8-flash-next` | retired by KubeTEE | `--kubetee` |
-| `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4-flash-0731` | `kubetee/deepseek/deepseek-v4-flash-0731` | retired by KubeTEE (2026-09-24) | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-tee` | `kubetee/deepseek/deepseek-v4.1-flash` | `llm.kubetee.ai` | `--kubetee` |
 | `deepseek/deepseek-v4.1-flash-1017-tee` | `kubetee/deepseek/deepseek-v4.1-flash-1017` | `llm.kubetee.ai` | `--kubetee` |
-| `mistral/mistral-large-4-tee` | `kubetee/mistralai/mistral-large-4` | `llm.kubetee.ai` | `--kubetee` |
-| `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | `llm.kubetee.ai` | `--kubetee` |
+| `moonshot/kimi-k3-tee` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
+| `moonshot/kimi-k3.1-pro-tee` | `kubetee/moonshotai/kimi-k3.1-pro` | `llm.kubetee.ai` | `--kubetee` |
+| `mistral/mistral-large-4-tee` | `kubetee/mistralai/mistral-large-4` | retired by KubeTEE (2026-11-03) | `--kubetee` |
+| `ornith/ornith-1.5-397b-tee` | `kubetee/ornith/ornith-1.5-397b` | retired by KubeTEE (2026-11-03) | `--kubetee` |
 | `xiaomi/mimo-v2.6-pro-ultraspeed-tee` | `kubetee/xiaomi/mimo-v2.6-pro` | `llm.kubetee.ai` | `--kubetee` |
 | `bfl/flux.2-klein-4b` | `kubetee/black-forest-labs/flux.2-klein-4b` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
+| `moonshot/kimi-k3.1-pro` | `engy/kimi-k3.1-pro` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
 | `zai/glm-5.1-tee` | `near/zai-org/GLM-5.1-FP8` | retired by NEAR (2026-09-24) | `--near` |
@@ -131,7 +133,9 @@ explicitly rejected because its echo is the deployment name. Bedrock Mantle acce
 from the fixed network-selected registry binding snapshot in `us-east-1` and requires the
 `bedrock-mantle-model-bindings-v1` approved image feature plus the selected row revision.
 The adapter validates the raw provider identity and canonicalizes the response model before
-content release. Older images and unadmitted models remain unavailable. Selecting one per worker does
+content release. It rewrites only the bound request model and forwards every other
+body field for Bedrock to validate. Older images and unadmitted models remain
+unavailable. Selecting one per worker does
 **not** make every model on that provider a registry-admissible route, and a
 successful upstream probe is not evidence of admission:
 
@@ -250,6 +254,7 @@ source pair happens to equal the buyer pair:
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
+gmcli declare-product --provider engy --model kimi-k3.1-pro --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4.1-flash --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
@@ -351,12 +356,13 @@ before serving inference: the verifier requests a quote for a fresh nonce on
 that connection and requires
 
 - the nonce echoed back exactly;
+- a `kubetee.attestation.v1` keyset that names this connection's serving key
+  for `llm.kubetee.ai` and has not expired, and a binding statement over that
+  keyset's digest and the nonce (the `kubetee.attestation.v1` specification
+  §4-5). A response without the v1 `keyset` and `bindings` fields is refused;
 - the Intel TDX quote verifying at `UpToDate` TCB with the debug bit clear;
-- the quote's `report_data` equal to SHA-512 of the nonce (the live gateway
-  construction; the v1 `kubetee.attestation.v1` JCS-statement binding replaces
-  it at the gateway flip — see the `kubetee.attestation.v1` specification §4,
-  incl. the pinned conformance vectors; `attestd/src/report_data.rs`'s
-  `sha512(pubkey || nonce)` is the separate gm-side attestation-info contract);
+- the quote's `report_data` equal to SHA-256 of that statement, zero-padded to
+  64 bytes;
 - the CC event log replaying to the quote's RTMR0-3;
 - KubeTEE's TLS-possession proof naming this connection's certificate, with
   that certificate's key signing the nonce.
@@ -375,13 +381,11 @@ connection.
 The verifier serves only the chat models compiled into the image:
 `z-ai/glm-5.2`, `z-ai/glm-5.3`, `z-ai/glm-5.3-flash`,
 `deepseek/deepseek-v4.1-flash`, `deepseek/deepseek-v4.1-flash-1017`,
-`mistralai/mistral-large-4`, `ornith/ornith-1.5-397b` and
-`xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
+`moonshotai/kimi-k3`, `moonshotai/kimi-k3.1-pro` and `xiaomi/mimo-v2.6-pro`. Envoy answers a chat request for any other KubeTEE model
 with 400, and the verifier refuses a request whose body names a model other than
 the one selected. Image generation keeps its direct route. Its `GET /v1/models`
-answer is KubeTEE's own list narrowed to those chat models, the image model
-`black-forest-labs/flux.2-klein-4b` and the video model `minimax/h3` served by
-the direct routes. Discovery does not establish registry admission. Each attestation
+answer is KubeTEE's own list narrowed to those chat models and the image model
+`black-forest-labs/flux.2-klein-4b` served by the direct route. Discovery does not establish registry admission. Each attestation
 and model-list response is read within 60 seconds, body included. Adding a
 KubeTEE chat model requires a new image build and the normal image-approval
 process.
@@ -437,7 +441,8 @@ and only one of them will be routed. In rough order of frequency:
   then `gmcli deploy`.
 - The worker has not been probed since it came up. Wait a cycle and re-check.
 - The worker is on an image version the registry no longer approves — `gmcli
-  worker list` shows each worker's status and last attestation. A route added in a
+  worker list` shows each worker's status, last attestation, and image version
+  with its standing (supported, deprecated, or revoked). A route added in a
   newer image cannot be served by a worker still running an older one.
 - The worker was just restored from suspension; its supported-model list is
   cleared and repopulates on the next probe.
