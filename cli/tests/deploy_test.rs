@@ -51,6 +51,7 @@ impl StubPhala {
 impl PhalaClient for StubPhala {
     fn deploy(
         &self,
+        _kms_contract_id: &str,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
@@ -79,6 +80,7 @@ struct TimedOutPhala;
 impl PhalaClient for TimedOutPhala {
     fn deploy(
         &self,
+        _kms_contract_id: &str,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
@@ -104,6 +106,7 @@ struct FailingPhala;
 impl PhalaClient for FailingPhala {
     fn deploy(
         &self,
+        _kms_contract_id: &str,
         _compose_yaml: &str,
         _env_vars: &ProviderKeys,
         _node_secret: &str,
@@ -136,9 +139,8 @@ fn versions_body(compose_hash: &str, os_image_hash: &str) -> serde_json::Value {
 
 // ── Core verification tests ───────────────────────────────────────────────────
 
-/// The central trust guarantee: if Phala Cloud returns hashes that do NOT
-/// match the registry-approved version, `verify_hashes` must return an
-/// `Err`. This causes `cmd_deploy` to refuse to register and exit non-zero.
+/// When Phala Cloud returns hashes that differ from the selected image
+/// version, `verify_hashes` returns an error.
 #[test]
 fn mismatched_hashes_produce_error() {
     let approved = ImageVersion {
@@ -146,16 +148,17 @@ fn mismatched_hashes_produce_error() {
         git_tag: None,
         os_image_hash: "approved-os-hash".to_owned(),
         status: "supported".to_owned(),
+        deprecation_end_epoch: None,
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
         features: vec![],
     };
 
-    // Phala Cloud returns DIFFERENT hashes (simulates a tampered deploy).
+    // Phala Cloud reports hashes for a different image version.
     let actual = DstackDeployResult {
-        compose_sha256: "TAMPERED-compose-hash".to_owned(),
-        os_image_hash: "TAMPERED-os-hash".to_owned(),
+        compose_sha256: "different-compose-hash".to_owned(),
+        os_image_hash: "different-os-hash".to_owned(),
     };
 
     let err =
@@ -175,7 +178,7 @@ fn mismatched_hashes_produce_error() {
         "error must mention os_image_hash; got: {msg}"
     );
     assert!(msg.contains("approved-compose-hash"));
-    assert!(msg.contains("TAMPERED-compose-hash"));
+    assert!(msg.contains("different-compose-hash"));
 }
 
 /// When only the compose hash is wrong, the error must call that out precisely.
@@ -186,6 +189,7 @@ fn compose_mismatch_error_is_specific() {
         compose_hash: "correct-compose".to_owned(),
         os_image_hash: "correct-os".to_owned(),
         status: "supported".to_owned(),
+        deprecation_end_epoch: None,
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
@@ -213,6 +217,7 @@ fn os_hash_mismatch_error_is_specific() {
         compose_hash: "correct-compose".to_owned(),
         os_image_hash: "correct-os".to_owned(),
         status: "supported".to_owned(),
+        deprecation_end_epoch: None,
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
@@ -240,6 +245,7 @@ fn matched_hashes_succeed() {
         compose_hash: "abc123".to_owned(),
         os_image_hash: "def456".to_owned(),
         status: "supported".to_owned(),
+        deprecation_end_epoch: None,
         notes: None,
         created_at: "2025-01-01T00:00:00Z".to_owned(),
         image_ref: None,
@@ -283,15 +289,22 @@ async fn deploy_flow_matched_hashes_calls_verify_ok() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "registry-selected-contract",
+            &rendered,
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+        )
         .unwrap();
 
     assert!(stub.deploy_called.get(), "deploy must have been called");
     assert!(verify_hashes(&actual.hashes, approved).is_ok());
 }
 
-/// Mismatch path: Phala Cloud returns different hashes → verify fails →
-/// deploy refuses to register.
+/// Mismatch path: Phala Cloud returns hashes for a different image version,
+/// and deploy verification returns an error.
 #[tokio::test]
 async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     let server = MockServer::start().await;
@@ -309,7 +322,7 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     let versions = fetch_supported_versions(&server.uri()).await.unwrap();
     let approved = select_version(&versions, None).unwrap();
 
-    // Phala Cloud returns DIFFERENT hashes — simulates a tampered build.
+    // Phala Cloud reports hashes for a different image version.
     let stub = StubPhala::matching("different-compose", "different-os");
     let keys = ProviderKeys {
         anthropic: Some("key".to_owned()),
@@ -320,7 +333,14 @@ async fn deploy_flow_mismatched_hashes_causes_verify_error() {
     };
     let rendered = render_compose(COMPOSE_TEMPLATE, "ghcr.io/o/app@sha256:abc", "testnet").unwrap();
     let actual = stub
-        .deploy(&rendered, &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "registry-selected-contract",
+            &rendered,
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+        )
         .unwrap();
 
     let err = verify_hashes(&actual.hashes, approved)
@@ -428,7 +448,14 @@ fn phala_failure_surfaces_as_error() {
         ..ProviderKeys::default()
     };
     let err = FailingPhala
-        .deploy("compose-content", &keys, "test-node-secret-1234", None, 300)
+        .deploy(
+            "registry-selected-contract",
+            "compose-content",
+            &keys,
+            "test-node-secret-1234",
+            None,
+            300,
+        )
         .expect_err("failing phala must produce an error");
     assert!(err.to_string().contains("phala deploy exited"));
 }
@@ -447,7 +474,14 @@ fn timeout_error_is_actionable() {
         ..ProviderKeys::default()
     };
     let err = TimedOutPhala
-        .deploy("compose", &keys, "test-node-secret-1234", None, 0)
+        .deploy(
+            "registry-selected-contract",
+            "compose",
+            &keys,
+            "test-node-secret-1234",
+            None,
+            0,
+        )
         .expect_err("timed-out deploy must produce an error");
     let msg = err.to_string();
     assert!(
@@ -615,7 +649,7 @@ fn dist_dir_used_verbatim_when_provided() {
         explicit_dir.clone(),
         "tdx.medium",
         "40G",
-        "dstack-0.5.7",
+        "dstack-0.6.5",
     );
     assert_eq!(client.project_dir, explicit_dir);
     assert!(

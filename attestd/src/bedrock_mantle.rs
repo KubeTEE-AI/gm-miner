@@ -1,16 +1,16 @@
 //! Fixed Bedrock Mantle Messages adapter for registry-authorized Anthropic models.
 //!
 //! The inbound Anthropic request is parsed into a bounded, duplicate-aware
-//! JSON value. Only the reviewed Messages fields and client-executed custom
-//! tool protocol are accepted. The adapter then builds a fresh request to the
-//! fixed Mantle hostname and path, replacing only the request model selector.
+//! JSON value. The adapter rewrites only the bound request model and leaves all
+//! other body fields for Bedrock to validate. It builds a fresh request to the
+//! fixed Mantle hostname and path.
 //! The raw AWS response identity is checked before its model field is rewritten
 //! to the canonical registry model and before any response bytes are released.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -18,18 +18,23 @@ use axum::{
     body::{to_bytes, Body, Bytes},
     extract::State,
     http::{
-        header::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
         HeaderMap, HeaderValue, Method, Request, Response, StatusCode,
     },
     routing::any,
     Router,
 };
 use futures_util::{stream, StreamExt};
+use rand::RngExt as _;
 use reqwest::{redirect::Policy, Client};
 use rustls::{ClientConfig, RootCertStore};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
-use tokio::{net::TcpListener, sync::RwLock, time::MissedTickBehavior};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, RwLock},
+    time::Instant as TokioInstant,
+};
 use tracing::info;
 
 use crate::strict_json::parse_unique_json;
@@ -46,21 +51,45 @@ pub const MODEL_BINDING_REVISION_HEADER: &str = "x-gm-model-binding-revision";
 const BEDROCK_MANTLE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages";
 const BEDROCK_BINDINGS_PATH: &str = "/model-bindings/bedrock";
 const MAX_REQUEST_BODY: usize = 20 * 1024 * 1024;
+const MAX_ANTHROPIC_BETA_HEADER_BYTES: usize = 1024;
 const MAX_RESPONSE_BODY: usize = 32 * 1024 * 1024;
 const MAX_STREAM_PREAMBLE: usize = 64 * 1024;
 /// One in-body SSE frame. A thinking block's closing signature frame grows with
 /// the thinking (about 75 KB at 32k thinking tokens); 4 MiB leaves wide headroom.
 const MAX_STREAM_FRAME: usize = 4 * 1024 * 1024;
 const MAX_BINDINGS_BODY: usize = 1024 * 1024;
+const MAX_ERROR_BODY: usize = 64 * 1024;
+const ERROR_BODY_WAIT: Duration = Duration::from_secs(5);
+const PROMPT_TOO_LONG: &[u8] = b"prompt is too long";
 const MAX_MODEL_BINDINGS: usize = 1024;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const BINDINGS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const BINDINGS_FRESHNESS_TTL: Duration = Duration::from_secs(120);
-/// Protocol-safe integer bound only. Model output ceilings belong to the
-/// provider/catalog; this bound does not drive allocation in the adapter.
-const MAX_TOKEN_FIELD_VALUE: u64 = u32::MAX as u64;
-const MAX_MESSAGES: usize = 16_384;
+const BINDINGS_ON_DEMAND_MIN_INTERVAL: Duration = Duration::from_secs(3);
+const BINDINGS_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+const BINDINGS_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(3);
+const BINDINGS_RETRY_MAX_DELAY: Duration = Duration::from_secs(35);
+const BINDINGS_FRESHNESS_TTL: Duration = Duration::from_secs(15 * 60);
+
+const _: () = assert!(
+    BINDINGS_REFRESH_TIMEOUT.as_millis()
+        + BINDINGS_RETRY_MAX_DELAY.as_millis()
+        + BINDINGS_RETRY_MAX_DELAY.as_millis() / 4
+        < BINDINGS_REFRESH_INTERVAL.as_millis()
+);
+
+fn next_delay(failures: u32, jitter_fraction: f64) -> Duration {
+    debug_assert!((0.0..=1.0).contains(&jitter_fraction));
+
+    let shift = failures.saturating_sub(1);
+    let base_seconds = BINDINGS_RETRY_INITIAL_DELAY
+        .as_secs()
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .min(BINDINGS_RETRY_MAX_DELAY.as_secs());
+    let base = Duration::from_secs(base_seconds);
+    base.saturating_add(base.mul_f64(jitter_fraction / 4.0))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelBinding {
@@ -149,28 +178,44 @@ impl BindingCache {
         Ok(())
     }
 
-    fn current_binding(
-        &self,
-        model: &str,
-        expected_revision: u64,
-        now: Instant,
-    ) -> Result<ModelBinding, Reject> {
-        let cached = self
-            .current
-            .as_ref()
-            .filter(|cached| {
-                now.saturating_duration_since(cached.fetched_at) <= BINDINGS_FRESHNESS_TTL
-            })
-            .ok_or(Reject::BindingsUnavailable)?;
-        let binding = cached
-            .snapshot
-            .bindings
-            .get(model)
-            .ok_or(Reject::UnsupportedModel)?;
-        if binding.revision != expected_revision {
-            return Err(Reject::BindingRevision);
+    fn current_binding(&self, model: &str, expected_revision: u64, now: Instant) -> BindingLookup {
+        let Some(cached) = self.current.as_ref() else {
+            return BindingLookup::Refresh(Reject::BindingsUnavailable);
+        };
+        let binding = cached.snapshot.bindings.get(model);
+        if binding.is_some_and(|binding| expected_revision < binding.revision) {
+            return BindingLookup::Behind;
         }
-        Ok(binding.clone())
+        if now.saturating_duration_since(cached.fetched_at) > BINDINGS_FRESHNESS_TTL {
+            return BindingLookup::Refresh(Reject::BindingsUnavailable);
+        }
+        let Some(binding) = binding else {
+            return BindingLookup::Refresh(Reject::UnsupportedModel);
+        };
+        if binding.revision != expected_revision {
+            return BindingLookup::Refresh(Reject::BindingRevision);
+        }
+        BindingLookup::Ready(binding.clone())
+    }
+}
+
+enum BindingLookup {
+    Ready(ModelBinding),
+    Behind,
+    Refresh(Reject),
+}
+
+impl BindingLookup {
+    fn needs_refresh(&self) -> bool {
+        matches!(self, Self::Refresh(_))
+    }
+
+    fn into_result(self) -> Result<ModelBinding, Reject> {
+        match self {
+            Self::Ready(binding) => Ok(binding),
+            Self::Behind => Err(Reject::BindingRevision),
+            Self::Refresh(reject) => Err(reject),
+        }
     }
 }
 
@@ -181,6 +226,9 @@ pub struct BedrockMantleState {
     registry_network: String,
     registry_url: String,
     bindings: Arc<RwLock<BindingCache>>,
+    refresh_task_started: Arc<OnceLock<()>>,
+    refresh_nudge: watch::Sender<u64>,
+    refresh_status: watch::Sender<BindingRefreshStatus>,
     #[cfg(test)]
     test_upstream_url: Option<String>,
 }
@@ -210,6 +258,11 @@ impl BedrockMantleState {
             .map_err(|_| "Bedrock API key is not a valid HTTP credential")?;
 
         let client = production_http_client()?;
+        let (refresh_nudge, _) = watch::channel(0);
+        let (refresh_status, _) = watch::channel(BindingRefreshStatus::OnDemandGap {
+            generation: 0,
+            until: TokioInstant::now(),
+        });
 
         Ok(Self {
             client,
@@ -217,6 +270,9 @@ impl BedrockMantleState {
             registry_network: network,
             registry_url: format!("{registry_url}{BEDROCK_BINDINGS_PATH}"),
             bindings: Arc::new(RwLock::new(BindingCache::default())),
+            refresh_task_started: Arc::new(OnceLock::new()),
+            refresh_nudge,
+            refresh_status,
             #[cfg(test)]
             test_upstream_url: None,
         })
@@ -237,6 +293,11 @@ impl BedrockMantleState {
             .timeout(Duration::from_secs(2))
             .build()
             .expect("test HTTP client");
+        let (refresh_nudge, _) = watch::channel(0);
+        let (refresh_status, _) = watch::channel(BindingRefreshStatus::OnDemandGap {
+            generation: 0,
+            until: TokioInstant::now(),
+        });
         Self {
             client,
             authorization: HeaderValue::from_str(authorization).expect("test credential"),
@@ -246,6 +307,9 @@ impl BedrockMantleState {
                 test_bindings_payload(),
                 Instant::now(),
             ))),
+            refresh_task_started: Arc::new(OnceLock::new()),
+            refresh_nudge,
+            refresh_status,
             test_upstream_url: Some(url.to_owned()),
         }
     }
@@ -256,11 +320,126 @@ impl BedrockMantleState {
         self
     }
 
+    #[cfg(test)]
+    async fn refresh_bindings(&self) -> Result<(), &'static str> {
+        self.binding_refresher().refresh_bindings().await
+    }
+
+    fn binding_refresher(&self) -> BindingRefresher {
+        BindingRefresher {
+            client: self.client.clone(),
+            registry_network: self.registry_network.clone(),
+            registry_url: self.registry_url.clone(),
+            bindings: self.bindings.clone(),
+        }
+    }
+
+    fn start_binding_refresher(&self) {
+        self.refresh_task_started.get_or_init(|| {
+            let refresher = self.binding_refresher();
+            let nudge = self.refresh_nudge.subscribe();
+            let status = self.refresh_status.clone();
+            tokio::spawn(run_binding_refresher(refresher, nudge, status));
+        });
+    }
+
+    async fn wait_for_binding_refresh(&self) {
+        let mut status = self.refresh_status.subscribe();
+        self.start_binding_refresher();
+        let initial = *status.borrow_and_update();
+        let generation = initial.generation();
+        let now = TokioInstant::now();
+        let deadline = match initial {
+            BindingRefreshStatus::InFlight { deadline, .. } => deadline,
+            BindingRefreshStatus::FailureBackoff { until, .. } if now < until => {
+                return;
+            }
+            BindingRefreshStatus::OnDemandGap { until, .. } => {
+                until.max(now) + BINDINGS_REFRESH_TIMEOUT
+            }
+            BindingRefreshStatus::FailureBackoff { .. } => now + BINDINGS_REFRESH_TIMEOUT,
+        };
+        let _ = tokio::time::timeout_at(deadline, async {
+            loop {
+                let current = *status.borrow_and_update();
+                if current.generation() != generation {
+                    return;
+                }
+                let should_nudge = match current {
+                    BindingRefreshStatus::InFlight { .. } => false,
+                    BindingRefreshStatus::FailureBackoff { until, .. }
+                        if TokioInstant::now() < until =>
+                    {
+                        return;
+                    }
+                    BindingRefreshStatus::OnDemandGap { until, .. }
+                        if TokioInstant::now() < until =>
+                    {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(until) => {}
+                            changed = status.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    BindingRefreshStatus::FailureBackoff { .. }
+                    | BindingRefreshStatus::OnDemandGap { .. } => true,
+                };
+                if should_nudge {
+                    self.refresh_nudge
+                        .send_modify(|requested| *requested = (*requested).max(generation));
+                }
+                if status.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BindingRefreshStatus {
+    InFlight {
+        generation: u64,
+        deadline: TokioInstant,
+    },
+    FailureBackoff {
+        generation: u64,
+        until: TokioInstant,
+    },
+    OnDemandGap {
+        generation: u64,
+        until: TokioInstant,
+    },
+}
+
+impl BindingRefreshStatus {
+    fn generation(self) -> u64 {
+        match self {
+            Self::InFlight { generation, .. }
+            | Self::FailureBackoff { generation, .. }
+            | Self::OnDemandGap { generation, .. } => generation,
+        }
+    }
+}
+
+struct BindingRefresher {
+    client: Client,
+    registry_network: String,
+    registry_url: String,
+    bindings: Arc<RwLock<BindingCache>>,
+}
+
+impl BindingRefresher {
     async fn refresh_bindings(&self) -> Result<(), &'static str> {
         let response = self
             .client
             .get(&self.registry_url)
-            .timeout(Duration::from_secs(15))
+            .timeout(BINDINGS_REFRESH_TIMEOUT)
             .send()
             .await
             .map_err(|_| "fixed registry binding fetch failed")?;
@@ -282,6 +461,96 @@ impl BedrockMantleState {
         let body = read_bounded_registry_body(response).await?;
         let snapshot = parse_bindings_payload(&body, &self.registry_network)?;
         self.bindings.write().await.apply(snapshot, Instant::now())
+    }
+}
+
+async fn run_binding_refresher(
+    refresher: BindingRefresher,
+    mut nudge: watch::Receiver<u64>,
+    status: watch::Sender<BindingRefreshStatus>,
+) {
+    let mut consecutive_failures = 0_u32;
+    let mut last_completed_at = None;
+    let mut next_attempt_at = None;
+    let mut current_generation = status.borrow().generation();
+    let mut nudge_pending = false;
+
+    loop {
+        if nudge.has_changed().unwrap_or(false) {
+            let requested_generation = *nudge.borrow_and_update();
+            nudge_pending = requested_generation >= current_generation;
+        }
+
+        let now = TokioInstant::now();
+        let periodic_at = next_attempt_at.unwrap_or(now);
+        let demand_at = nudge_pending.then(|| {
+            let min_interval_at = last_completed_at.map_or(now, |last_completed_at| {
+                last_completed_at + BINDINGS_ON_DEMAND_MIN_INTERVAL
+            });
+            let backoff_at = if consecutive_failures > 0 {
+                next_attempt_at.unwrap_or(now)
+            } else {
+                now
+            };
+            min_interval_at.max(backoff_at)
+        });
+        let wake_at = demand_at.map_or(periodic_at, |demand_at| periodic_at.min(demand_at));
+
+        if now < wake_at {
+            tokio::select! {
+                () = tokio::time::sleep_until(wake_at) => {}
+                changed = nudge.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let requested_generation = *nudge.borrow_and_update();
+                    nudge_pending = requested_generation >= current_generation;
+                    continue;
+                }
+            }
+        }
+
+        let now = TokioInstant::now();
+        let periodic_due = next_attempt_at.is_none_or(|next_attempt_at| now >= next_attempt_at);
+        let demand_due = demand_at.is_some_and(|demand_at| now >= demand_at);
+        if !periodic_due && !demand_due {
+            continue;
+        }
+
+        let _ = nudge.borrow_and_update();
+        status.send_replace(BindingRefreshStatus::InFlight {
+            generation: current_generation,
+            deadline: now + BINDINGS_REFRESH_TIMEOUT,
+        });
+        let result = refresher.refresh_bindings().await;
+        let completed_at = TokioInstant::now();
+        last_completed_at = Some(completed_at);
+        let delay = if result.is_ok() {
+            consecutive_failures = 0;
+            BINDINGS_REFRESH_INTERVAL
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            next_delay(consecutive_failures, rand::rng().random::<f64>())
+        };
+        let next_attempt = completed_at + delay;
+        next_attempt_at = Some(next_attempt);
+        current_generation = current_generation.wrapping_add(1);
+        let next_status = if result.is_ok() {
+            BindingRefreshStatus::OnDemandGap {
+                generation: current_generation,
+                until: completed_at + BINDINGS_ON_DEMAND_MIN_INTERVAL,
+            }
+        } else {
+            BindingRefreshStatus::FailureBackoff {
+                generation: current_generation,
+                until: next_attempt,
+            }
+        };
+        status.send_replace(next_status);
+        nudge_pending = *nudge.borrow_and_update() >= current_generation;
+        if let Err(error) = result {
+            tracing::warn!(error, "Bedrock model bindings refresh was rejected");
+        }
     }
 }
 
@@ -508,17 +777,7 @@ struct AppState(BedrockMantleState);
 ///
 /// Returns an error if the server stops with an I/O failure.
 pub async fn serve(listener: TcpListener, state: BedrockMantleState) -> Result<(), &'static str> {
-    let refresh_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(BINDINGS_REFRESH_INTERVAL);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            if let Err(error) = refresh_state.refresh_bindings().await {
-                tracing::warn!(error, "Bedrock model bindings refresh was rejected");
-            }
-        }
-    });
+    state.start_binding_refresher();
     let app = Router::new()
         .route("/v1/messages", any(handle_request))
         .with_state(AppState(state));
@@ -551,27 +810,38 @@ enum Reject {
     Upstream,
     UpstreamTransport,
     UpstreamHttp(u16),
+    UpstreamThrottled { retry_after_secs: Option<u32> },
+    UpstreamUnauthorized,
+    UpstreamForbidden,
+    UpstreamInvalidRequest { prompt_too_long: bool },
+    UpstreamTooLarge,
     ModelIdentityMismatch,
 }
 
 impl Reject {
     // Fixed categories only: never log provider bodies, model strings, headers,
-    // credentials, or request content. Public error bodies remain unchanged.
+    // credentials, or request content.
     fn upstream_diagnostic(self) -> Option<(&'static str, Option<u16>)> {
         match self {
             Self::Upstream => Some(("upstream_response_invalid", None)),
             Self::UpstreamTransport => Some(("upstream_transport_failed", None)),
             Self::UpstreamHttp(status) => Some(("upstream_http_rejected", Some(status))),
+            Self::UpstreamThrottled { .. } => Some(("upstream_http_rejected", Some(429))),
+            Self::UpstreamUnauthorized => Some(("upstream_http_rejected", Some(401))),
+            Self::UpstreamForbidden => Some(("upstream_http_rejected", Some(403))),
+            Self::UpstreamInvalidRequest { .. } => Some(("upstream_http_rejected", Some(400))),
+            Self::UpstreamTooLarge => Some(("upstream_http_rejected", Some(413))),
             Self::ModelIdentityMismatch => Some(("model_identity_mismatch", None)),
             _ => None,
         }
     }
 
-    fn into_response(self) -> Response<Body> {
-        if let Some((reason, upstream_status)) = self.upstream_diagnostic() {
-            tracing::warn!(reason, upstream_status, "Bedrock Mantle request rejected");
-        }
-        let (status, error_type, message) = match self {
+    // Public bodies are fixed strings, never provider text: an AWS error can
+    // name the account, role or ARN behind the worker's credential. The gm
+    // gateway reads the 401/403 bodies' `invalid_api_key` as a provider-account
+    // failure on any status; no other body here may carry a drain phrase.
+    fn public_error(self) -> (StatusCode, &'static str, &'static str) {
+        match self {
             Self::Method => (
                 StatusCode::METHOD_NOT_ALLOWED,
                 "invalid_request_error",
@@ -595,7 +865,7 @@ impl Reject {
             Self::InvalidBody => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "Bedrock Messages body is not supported",
+                "Bedrock Messages body is invalid",
             ),
             Self::UnsupportedModel => (
                 StatusCode::BAD_REQUEST,
@@ -612,6 +882,40 @@ impl Reject {
                 "api_error",
                 "Bedrock model bindings are unavailable or stale",
             ),
+            Self::UpstreamThrottled { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "Bedrock Mantle throttled the request",
+            ),
+            Self::UpstreamUnauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Bedrock Mantle rejected the worker credential (invalid_api_key)",
+            ),
+            Self::UpstreamForbidden => (
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Bedrock Mantle denied the worker credential access (invalid_api_key)",
+            ),
+            Self::UpstreamInvalidRequest {
+                prompt_too_long: true,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Bedrock Mantle rejected the request: prompt is too long",
+            ),
+            Self::UpstreamInvalidRequest {
+                prompt_too_long: false,
+            } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Bedrock Mantle rejected the request as invalid",
+            ),
+            Self::UpstreamTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "Bedrock Mantle rejected the request size",
+            ),
             Self::Upstream
             | Self::UpstreamTransport
             | Self::UpstreamHttp(_)
@@ -620,9 +924,25 @@ impl Reject {
                 "api_error",
                 "Bedrock Mantle request failed",
             ),
-        };
+        }
+    }
+
+    fn into_response(self) -> Response<Body> {
+        if let Some((reason, upstream_status)) = self.upstream_diagnostic() {
+            tracing::warn!(reason, upstream_status, "Bedrock Mantle request rejected");
+        }
+        let (status, error_type, message) = self.public_error();
         let body = format!("{{\"error\":{{\"type\":\"{error_type}\",\"message\":\"{message}\"}}}}");
-        response(status, "application/json", Body::from(body))
+        let mut response = response(status, "application/json", Body::from(body));
+        if let Self::UpstreamThrottled {
+            retry_after_secs: Some(seconds),
+        } = self
+        {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }
 
@@ -641,17 +961,16 @@ async fn forward_request(
     {
         return Err(Reject::Path);
     }
-    let requested_binding_revision = validate_inbound_headers(request.headers())?;
+    let (requested_binding_revision, anthropic_beta) = validate_inbound_headers(request.headers())?;
 
     let bytes = to_bytes(request.into_body(), MAX_REQUEST_BODY)
         .await
         .map_err(|_| Reject::BodyTooLarge)?;
-    let (mut request_body, stream_response) = prepare_request_body(&bytes)?;
-    let model = request_body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or(Reject::InvalidBody)?
-        .to_owned();
+    let PreparedRequestBody {
+        mut fields,
+        model,
+        stream_response,
+    } = prepare_request_body(&bytes)?;
     let accept = if stream_response {
         "text/event-stream"
     } else {
@@ -671,23 +990,31 @@ async fn forward_request(
     // read lock through the synchronous model rewrite and request build, then
     // start the provider request immediately; a refresh cannot interleave
     // between the current binding check and request construction.
-    let cache = state.bindings.read().await;
-    let binding = cache.current_binding(&model, requested_binding_revision, Instant::now())?;
-    request_body
-        .as_object_mut()
-        .ok_or(Reject::InvalidBody)?
-        .insert(
-            "model".to_owned(),
-            Value::String(binding.upstream_model.clone()),
-        );
-    let upstream_body = serde_json::to_vec(&request_body).map_err(|_| Reject::InvalidBody)?;
-    let upstream_request = state
+    let mut cache = state.bindings.read().await;
+    let mut lookup = cache.current_binding(&model, requested_binding_revision, Instant::now());
+    if lookup.needs_refresh() {
+        drop(cache);
+        state.wait_for_binding_refresh().await;
+        cache = state.bindings.read().await;
+        lookup = cache.current_binding(&model, requested_binding_revision, Instant::now());
+    }
+    let binding = lookup.into_result()?;
+    fields.insert(
+        "model".to_owned(),
+        Value::String(binding.upstream_model.clone()),
+    );
+    let upstream_body = serde_json::to_vec(&fields).map_err(|_| Reject::InvalidBody)?;
+    let mut upstream_request = state
         .client
         .post(url)
         .header(AUTHORIZATION, state.authorization.clone())
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, accept)
+        .header(ACCEPT, accept);
+    if let Some(value) = anthropic_beta {
+        upstream_request = upstream_request.header("anthropic-beta", value);
+    }
+    let upstream_request = upstream_request
         .body(upstream_body)
         .build()
         .map_err(|_| Reject::Upstream)?;
@@ -707,7 +1034,7 @@ async fn finish_upstream_response(
     stream_response: bool,
 ) -> Result<Response<Body>, Reject> {
     if upstream.status() != StatusCode::OK {
-        return Err(Reject::UpstreamHttp(upstream.status().as_u16()));
+        return Err(upstream_rejection(upstream).await);
     }
     if stream_response {
         let content_type = upstream
@@ -756,7 +1083,7 @@ async fn finish_upstream_response(
         {
             return Err(Reject::Upstream);
         }
-        let body = read_bounded_response(upstream).await?;
+        let body = read_bounded_body(upstream, MAX_RESPONSE_BODY).await?;
         let body = canonicalize_response_identity(&body, &binding.response_model, &binding.model)?;
         Ok(response_with_binding_revision(
             StatusCode::OK,
@@ -767,7 +1094,45 @@ async fn finish_upstream_response(
     }
 }
 
-fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
+async fn upstream_rejection(upstream: reqwest::Response) -> Reject {
+    match upstream.status() {
+        StatusCode::TOO_MANY_REQUESTS => Reject::UpstreamThrottled {
+            retry_after_secs: retry_after_secs(upstream.headers()),
+        },
+        StatusCode::UNAUTHORIZED => Reject::UpstreamUnauthorized,
+        StatusCode::FORBIDDEN => Reject::UpstreamForbidden,
+        StatusCode::BAD_REQUEST => Reject::UpstreamInvalidRequest {
+            prompt_too_long: tokio::time::timeout(
+                ERROR_BODY_WAIT,
+                read_bounded_body(upstream, MAX_ERROR_BODY),
+            )
+            .await
+            .is_ok_and(|body| body.is_ok_and(|body| signals_prompt_too_long(&body))),
+        },
+        StatusCode::PAYLOAD_TOO_LARGE => Reject::UpstreamTooLarge,
+        status => Reject::UpstreamHttp(status.as_u16()),
+    }
+}
+
+/// Only the delay-seconds form is relayed; an HTTP-date or garbage value is
+/// dropped rather than replaced with a guess.
+fn retry_after_secs(headers: &HeaderMap) -> Option<u32> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+// Anthropic's context-window refusal; the gm gateway reroutes a 400 carrying
+// this phrase to a wider-window route when its capability retry is enabled.
+fn signals_prompt_too_long(body: &[u8]) -> bool {
+    body.to_ascii_lowercase()
+        .windows(PROMPT_TOO_LONG.len())
+        .any(|window| window == PROMPT_TOO_LONG)
+}
+
+fn validate_inbound_headers(headers: &HeaderMap) -> Result<(u64, Option<HeaderValue>), Reject> {
     let mut execution_policies = headers.get_all(EXECUTION_POLICY_HEADER).iter();
     if execution_policies
         .next()
@@ -775,19 +1140,6 @@ fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
         != Some(EXACT_CANONICAL_NO_REPLAY_POLICY)
         || execution_policies.next().is_some()
     {
-        return Err(Reject::Header);
-    }
-
-    if headers.contains_key("anthropic-workspace-id")
-        || headers.contains_key("anthropic-beta")
-        || headers.contains_key(CONTENT_ENCODING)
-    {
-        return Err(Reject::Header);
-    }
-    if headers.keys().any(|name| {
-        name.as_str().starts_with("x-amzn-bedrock-")
-            || (name.as_str().starts_with("anthropic-") && name.as_str() != "anthropic-version")
-    }) {
         return Err(Reject::Header);
     }
 
@@ -828,418 +1180,99 @@ fn validate_inbound_headers(headers: &HeaderMap) -> Result<u64, Reject> {
     if revisions[0].as_bytes() != revision.to_string().as_bytes() {
         return Err(Reject::Header);
     }
-    Ok(revision)
+    let anthropic_beta = validate_anthropic_beta_header(headers)?;
+    Ok((revision, anthropic_beta))
 }
 
-fn prepare_request_body(bytes: &[u8]) -> Result<(Value, bool), Reject> {
-    let mut value = parse_unique_json(bytes).map_err(|_| Reject::InvalidBody)?;
-    let object = value.as_object_mut().ok_or(Reject::InvalidBody)?;
-    let allowed = [
-        "model",
-        "max_tokens",
-        "messages",
-        "system",
-        "stop_sequences",
-        "temperature",
-        "top_p",
-        "top_k",
-        "stream",
-        "tools",
-        "tool_choice",
-        "thinking",
-        "output_config",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    if object.keys().any(|key| !allowed.contains(key.as_str())) {
-        return Err(Reject::InvalidBody);
+fn validate_anthropic_beta_header(headers: &HeaderMap) -> Result<Option<HeaderValue>, Reject> {
+    let mut values = headers.get_all("anthropic-beta").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Reject::Header);
     }
 
-    let model = object
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_ANTHROPIC_BETA_HEADER_BYTES
+        || bytes.iter().any(|byte| !(0x20..=0x7e).contains(byte))
+    {
+        return Err(Reject::Header);
+    }
+    for item in bytes.split(|byte| *byte == b',') {
+        let Some(start) = item.iter().position(|byte| *byte != b' ') else {
+            return Err(Reject::Header);
+        };
+        let Some(end) = item.iter().rposition(|byte| *byte != b' ') else {
+            return Err(Reject::Header);
+        };
+        if !item[start..=end].iter().copied().all(is_http_token_byte) {
+            return Err(Reject::Header);
+        }
+    }
+    Ok(Some(value.clone()))
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+#[derive(Debug, PartialEq)]
+struct PreparedRequestBody {
+    fields: Map<String, Value>,
+    model: String,
+    stream_response: bool,
+}
+
+fn prepare_request_body(bytes: &[u8]) -> Result<PreparedRequestBody, Reject> {
+    let value = parse_unique_json(bytes).map_err(|_| Reject::InvalidBody)?;
+    let Value::Object(fields) = value else {
+        return Err(Reject::InvalidBody);
+    };
+    let model = fields
         .get("model")
         .and_then(Value::as_str)
-        .ok_or(Reject::InvalidBody)?;
-    if !valid_model_id(model) {
+        .ok_or(Reject::InvalidBody)?
+        .to_owned();
+    if !valid_model_id(&model) {
         return Err(Reject::InvalidBody);
     }
-    let max_tokens = object
-        .get("max_tokens")
-        .and_then(Value::as_u64)
-        .filter(|value| (1..=MAX_TOKEN_FIELD_VALUE).contains(value))
-        .ok_or(Reject::InvalidBody)?;
-    let _ = max_tokens;
-    let messages = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|messages| !messages.is_empty() && messages.len() <= MAX_MESSAGES)
-        .ok_or(Reject::InvalidBody)?;
-    for message in messages {
-        validate_message(message)?;
-    }
-    if let Some(system) = object.get("system") {
-        validate_text_content(system)?;
-    }
-    let stream_response = match object.get("stream") {
+    let stream_response = match fields.get("stream") {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err(Reject::InvalidBody),
         None => false,
     };
-    if let Some(Value::Array(stops)) = object.get("stop_sequences") {
-        if stops.len() > 64 || stops.iter().any(|value| value.as_str().is_none()) {
-            return Err(Reject::InvalidBody);
-        }
-    } else if object.contains_key("stop_sequences") {
-        return Err(Reject::InvalidBody);
-    }
-    if let Some(value) = object.get("temperature") {
-        if !valid_unit_float(value) {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    if let Some(value) = object.get("top_p") {
-        if !valid_unit_float(value) {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    if let Some(value) = object.get("top_k") {
-        if value.as_u64().is_none_or(|value| value > 500) {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    if let Some(value) = object.get("tools") {
-        validate_tools(value)?;
-    }
-    if let Some(value) = object.get("tool_choice") {
-        validate_tool_choice(value)?;
-    }
-    if let Some(value) = object.get("thinking") {
-        validate_thinking(value)?;
-    }
-    if let Some(value) = object.get("output_config") {
-        validate_output_config(value)?;
-    }
-    Ok((value, stream_response))
+    Ok(PreparedRequestBody {
+        fields,
+        model,
+        stream_response,
+    })
 }
 
-fn valid_unit_float(value: &Value) -> bool {
-    value
-        .as_number()
-        .and_then(Number::as_f64)
-        .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value))
-}
-
-fn validate_message(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "role" | "content"))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    if !matches!(
-        object.get("role").and_then(Value::as_str),
-        Some("user" | "assistant")
-    ) {
-        return Err(Reject::InvalidBody);
-    }
-    let content = object.get("content").ok_or(Reject::InvalidBody)?;
-    validate_content(content, true)
-}
-
-fn validate_text_content(value: &Value) -> Result<(), Reject> {
-    match value {
-        Value::String(_) => Ok(()),
-        Value::Array(blocks) => {
-            for block in blocks {
-                validate_block(block, false)?;
-            }
-            Ok(())
-        }
-        _ => Err(Reject::InvalidBody),
-    }
-}
-
-fn validate_content(value: &Value, allow_tool_blocks: bool) -> Result<(), Reject> {
-    match value {
-        Value::String(_) => Ok(()),
-        Value::Array(blocks) => {
-            for block in blocks {
-                validate_block(block, allow_tool_blocks)?;
-            }
-            Ok(())
-        }
-        _ => Err(Reject::InvalidBody),
-    }
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the complete closed content-block allowlist stays together for audit"
-)]
-fn validate_block(value: &Value, allow_tool_blocks: bool) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    let kind = object
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or(Reject::InvalidBody)?;
-    match kind {
-        "text" => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "text" | "cache_control"))
-                || object.get("text").and_then(Value::as_str).is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            validate_cache_control(object.get("cache_control"))
-        }
-        "image" => {
-            if !allow_tool_blocks
-                || object
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "type" | "source" | "cache_control"))
-            {
-                return Err(Reject::InvalidBody);
-            }
-            validate_cache_control(object.get("cache_control"))?;
-            validate_inline_source(
-                object.get("source").ok_or(Reject::InvalidBody)?,
-                &["image/jpeg", "image/png", "image/gif", "image/webp"],
-            )
-        }
-        "document" => {
-            if !allow_tool_blocks
-                || object.keys().any(|key| {
-                    !matches!(
-                        key.as_str(),
-                        "type" | "source" | "title" | "context" | "cache_control"
-                    )
-                })
-            {
-                return Err(Reject::InvalidBody);
-            }
-            for key in ["title", "context"] {
-                if object
-                    .get(key)
-                    .is_some_and(|value| value.as_str().is_none())
-                {
-                    return Err(Reject::InvalidBody);
-                }
-            }
-            validate_cache_control(object.get("cache_control"))?;
-            validate_inline_source(
-                object.get("source").ok_or(Reject::InvalidBody)?,
-                &["application/pdf"],
-            )
-        }
-        "tool_use" if allow_tool_blocks => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "id" | "name" | "input"))
-                || object.get("id").and_then(Value::as_str).is_none()
-                || object.get("name").and_then(Value::as_str).is_none()
-                || object.get("input").is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            Ok(())
-        }
-        "tool_result" if allow_tool_blocks => {
-            if object.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "type" | "tool_use_id" | "content" | "is_error" | "cache_control"
-                )
-            }) || object.get("tool_use_id").and_then(Value::as_str).is_none()
-                || object
-                    .get("is_error")
-                    .is_some_and(|value| value.as_bool().is_none())
-            {
-                return Err(Reject::InvalidBody);
-            }
-            validate_cache_control(object.get("cache_control"))?;
-            if let Some(content) = object.get("content") {
-                validate_content(content, true)?;
-            }
-            Ok(())
-        }
-        "thinking" if allow_tool_blocks => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "thinking" | "signature"))
-                || object.get("thinking").and_then(Value::as_str).is_none()
-                || object.get("signature").and_then(Value::as_str).is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            Ok(())
-        }
-        "redacted_thinking" if allow_tool_blocks => {
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "data"))
-                || object.get("data").and_then(Value::as_str).is_none()
-            {
-                return Err(Reject::InvalidBody);
-            }
-            Ok(())
-        }
-        _ => Err(Reject::InvalidBody),
-    }
-}
-
-fn validate_inline_source(value: &Value, allowed_media_types: &[&str]) -> Result<(), Reject> {
-    let source = value.as_object().ok_or(Reject::InvalidBody)?;
-    if source
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "media_type" | "data"))
-        || source.get("type").and_then(Value::as_str) != Some("base64")
-        || source
-            .get("media_type")
-            .and_then(Value::as_str)
-            .is_none_or(|media| !allowed_media_types.contains(&media))
-        || source.get("data").and_then(Value::as_str).is_none()
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_cache_control(value: Option<&Value>) -> Result<(), Reject> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "ttl"))
-        || object.get("type").and_then(Value::as_str) != Some("ephemeral")
-        || object
-            .get("ttl")
-            .is_some_and(|ttl| !matches!(ttl.as_str(), Some("5m" | "1h")))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_tools(value: &Value) -> Result<(), Reject> {
-    let tools = value.as_array().ok_or(Reject::InvalidBody)?;
-    if tools.len() > 128 {
-        return Err(Reject::InvalidBody);
-    }
-    for tool in tools {
-        let object = tool.as_object().ok_or(Reject::InvalidBody)?;
-        if object.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "type" | "name" | "description" | "input_schema" | "cache_control" | "strict"
-            )
-        }) || object
-            .get("type")
-            .is_some_and(|value| value.as_str() != Some("custom"))
-            || object
-                .get("name")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            || object
-                .get("input_schema")
-                .and_then(Value::as_object)
-                .is_none()
-            || object
-                .get("description")
-                .is_some_and(|value| value.as_str().is_none())
-            || object
-                .get("strict")
-                .is_some_and(|value| value.as_bool().is_none())
-        {
-            return Err(Reject::InvalidBody);
-        }
-        validate_cache_control(object.get("cache_control"))?;
-    }
-    Ok(())
-}
-
-fn validate_tool_choice(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "name" | "disable_parallel_tool_use"))
-        || !matches!(
-            object.get("type").and_then(Value::as_str),
-            Some("auto" | "any" | "tool" | "none")
-        )
-        || object
-            .get("name")
-            .is_some_and(|value| value.as_str().is_none())
-        || object
-            .get("disable_parallel_tool_use")
-            .is_some_and(|value| value.as_bool().is_none())
-    {
-        return Err(Reject::InvalidBody);
-    }
-    if object.get("type").and_then(Value::as_str) == Some("tool")
-        && object.get("name").and_then(Value::as_str).is_none()
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_thinking(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "type" | "budget_tokens" | "effort"))
-        || !matches!(
-            object.get("type").and_then(Value::as_str),
-            Some("enabled" | "adaptive" | "disabled")
-        )
-        || object.get("budget_tokens").is_some_and(|value| {
-            value
-                .as_u64()
-                .is_none_or(|value| value == 0 || value > MAX_TOKEN_FIELD_VALUE)
-        })
-        || object
-            .get("effort")
-            .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    Ok(())
-}
-
-fn validate_output_config(value: &Value) -> Result<(), Reject> {
-    let object = value.as_object().ok_or(Reject::InvalidBody)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "effort" | "format"))
-        || object
-            .get("effort")
-            .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high" | "max")))
-    {
-        return Err(Reject::InvalidBody);
-    }
-    if let Some(format) = object.get("format") {
-        let format = format.as_object().ok_or(Reject::InvalidBody)?;
-        if format
-            .keys()
-            .any(|key| !matches!(key.as_str(), "type" | "schema"))
-            || format.get("type").and_then(Value::as_str) != Some("json_schema")
-            || format.get("schema").and_then(Value::as_object).is_none()
-        {
-            return Err(Reject::InvalidBody);
-        }
-    }
-    Ok(())
-}
-
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Reject> {
+async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, Reject> {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| Reject::UpstreamTransport)?;
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(Reject::Upstream);
         }
         body.extend_from_slice(&chunk);
@@ -1303,9 +1336,7 @@ async fn validate_stream_identity(
                 return Err(Reject::Upstream);
             }
             match parse_sse_preamble_frame(frame, expected_raw_model, canonical_model)? {
-                StreamPreambleEvent::Empty | StreamPreambleEvent::Ping => {
-                    scanned = after_frame;
-                }
+                StreamPreambleEvent::Other => scanned = after_frame,
                 StreamPreambleEvent::MessageStart(canonical_frame) => {
                     let capacity = buffer
                         .len()
@@ -1317,15 +1348,10 @@ async fn validate_stream_identity(
                     preamble.extend_from_slice(&buffer[after_frame..]);
                     return Ok((Bytes::from(preamble), source));
                 }
-                StreamPreambleEvent::Other => return Err(Reject::Upstream),
             }
         }
         if buffer.len().saturating_sub(scanned) > MAX_STREAM_PREAMBLE {
             return Err(Reject::Upstream);
-        }
-        if scanned > 0 && scanned >= buffer.len() / 2 {
-            buffer.drain(..scanned);
-            scanned = 0;
         }
     }
 }
@@ -1376,8 +1402,9 @@ fn guard_stream(source: BoxBodyStream) -> BoxBodyStream {
                             ));
                         }
                         match parse_stream_event(&pending[start..frame_end]) {
-                            Ok(StreamEvent::Empty | StreamEvent::Ping) if !terminal => {}
-                            Ok(StreamEvent::MessageStart) if !started && !terminal => {
+                            Ok(StreamEvent::Empty | StreamEvent::Ping | StreamEvent::Unknown)
+                                if !terminal => {}
+                            Ok(StreamEvent::MessageStart(_)) if !started && !terminal => {
                                 started = true;
                             }
                             Ok(StreamEvent::MessageStop | StreamEvent::Error)
@@ -1485,10 +1512,11 @@ impl StreamEnd {
 enum StreamEvent {
     Empty,
     Ping,
-    MessageStart,
+    MessageStart(Value),
     MessageStop,
     Error,
     Other,
+    Unknown,
 }
 
 fn parse_stream_event(frame: &[u8]) -> Result<StreamEvent, Reject> {
@@ -1538,23 +1566,21 @@ fn parse_stream_event(frame: &[u8]) -> Result<StreamEvent, Reject> {
         .filter(|data| !data.is_empty())
         .ok_or(Reject::Upstream)?;
     let value = parse_unique_json(&data).map_err(|_| Reject::Upstream)?;
-    if value.get("type").and_then(Value::as_str) != Some(event) {
+    if event.is_empty() || value.get("type").and_then(Value::as_str) != Some(event) {
         return Err(Reject::Upstream);
     }
     match event {
-        "message_start" => Ok(StreamEvent::MessageStart),
+        "message_start" => Ok(StreamEvent::MessageStart(value)),
         "message_stop" => Ok(StreamEvent::MessageStop),
         "error" => Ok(StreamEvent::Error),
         "content_block_start" | "content_block_delta" | "content_block_stop" | "message_delta" => {
             Ok(StreamEvent::Other)
         }
-        _ => Err(Reject::Upstream),
+        _ => Ok(StreamEvent::Unknown),
     }
 }
 
 enum StreamPreambleEvent {
-    Empty,
-    Ping,
     MessageStart(Vec<u8>),
     Other,
 }
@@ -1564,51 +1590,13 @@ fn parse_sse_preamble_frame(
     expected_raw_model: &str,
     canonical_model: &str,
 ) -> Result<StreamPreambleEvent, Reject> {
-    let text = std::str::from_utf8(frame).map_err(|_| Reject::Upstream)?;
-    let mut event = None;
-    let mut data = Vec::new();
-    for line in text.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.is_empty() || line.starts_with(':') {
-            continue;
+    let mut value = match parse_stream_event(frame)? {
+        StreamEvent::MessageStart(value) => value,
+        StreamEvent::Empty | StreamEvent::Ping | StreamEvent::Unknown => {
+            return Ok(StreamPreambleEvent::Other);
         }
-        if let Some(value) = line.strip_prefix("event:") {
-            if event.is_some() {
-                return Err(Reject::Upstream);
-            }
-            event = Some(value.trim_start());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                return Err(Reject::Upstream);
-            }
-            data.extend_from_slice(value.trim_start().as_bytes());
-        } else {
-            return Err(Reject::Upstream);
-        }
-    }
-    let Some(event) = event else {
-        return if data.is_empty() {
-            Ok(StreamPreambleEvent::Empty)
-        } else {
-            Err(Reject::Upstream)
-        };
+        _ => return Err(Reject::Upstream),
     };
-    if event == "ping" {
-        if !data.is_empty() {
-            let ping = parse_unique_json(&data).map_err(|_| Reject::Upstream)?;
-            if ping.get("type").and_then(Value::as_str) != Some("ping") {
-                return Err(Reject::Upstream);
-            }
-        }
-        return Ok(StreamPreambleEvent::Ping);
-    }
-    if event != "message_start" || data.is_empty() {
-        return Ok(StreamPreambleEvent::Other);
-    }
-    let mut value = parse_unique_json(&data).map_err(|_| Reject::Upstream)?;
-    if value.get("type").and_then(Value::as_str) != Some("message_start") {
-        return Err(Reject::Upstream);
-    }
     let message = value
         .get_mut("message")
         .and_then(Value::as_object_mut)
@@ -1675,6 +1663,7 @@ fn upstream_url(test_override: Option<&str>) -> &str {
 )]
 mod tests {
     use super::*;
+    use crate::gateway_contract::signals_drain;
     use axum::{
         body::to_bytes,
         routing::{get, post},
@@ -1691,10 +1680,10 @@ mod tests {
 
     #[test]
     fn request_model_is_validated_and_left_for_registry_binding_rewrite() {
-        let (value, streaming) = prepare_request_body(VALID_BODY.as_bytes()).expect("body");
-        assert_eq!(value["model"], TEST_MODEL_A);
-        assert_eq!(value["messages"][0]["content"], "hello");
-        assert!(!streaming);
+        let prepared = prepare_request_body(VALID_BODY.as_bytes()).expect("body");
+        assert_eq!(prepared.model, TEST_MODEL_A);
+        assert_eq!(prepared.fields["messages"][0]["content"], "hello");
+        assert!(!prepared.stream_response);
         for model in ["anthropic/test-model-a", "bad model"] {
             let body = VALID_BODY.replace(TEST_MODEL_A, model);
             assert_eq!(
@@ -1707,19 +1696,20 @@ mod tests {
     }
 
     #[test]
-    fn token_fields_use_protocol_integer_bounds_not_current_model_limits() {
-        let body = VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":128001");
-        assert!(prepare_request_body(body.as_bytes()).is_ok());
-        let largest = VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":4294967295");
-        assert!(prepare_request_body(largest.as_bytes()).is_ok());
+    fn request_parser_rejects_invalid_json_and_ambiguous_route_controls() {
         for invalid in [
-            VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":4294967296"),
-            VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":32.5"),
-            VALID_BODY.replace("\"max_tokens\":32", "\"max_tokens\":-1"),
+            "not json",
+            "[]",
+            "{}",
+            r#"{"max_tokens":32}"#,
+            r#"{"model":"bad/model"}"#,
+            r#"{"model":"test-model-a","stream":"true"}"#,
+            r#"{"model":"test-model-a","model":"test-model-b"}"#,
         ] {
             assert_eq!(
                 prepare_request_body(invalid.as_bytes()),
-                Err(Reject::InvalidBody)
+                Err(Reject::InvalidBody),
+                "{invalid}"
             );
         }
     }
@@ -1816,13 +1806,16 @@ mod tests {
                 TEST_MODEL_REVISION_A,
                 now + BINDINGS_FRESHNESS_TTL
             )
+            .into_result()
             .is_ok());
         assert_eq!(
-            cache.current_binding(
-                TEST_MODEL_A,
-                TEST_MODEL_REVISION_A,
-                now + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
-            ),
+            cache
+                .current_binding(
+                    TEST_MODEL_A,
+                    TEST_MODEL_REVISION_A,
+                    now + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
+                )
+                .into_result(),
             Err(Reject::BindingsUnavailable)
         );
 
@@ -1838,6 +1831,7 @@ mod tests {
                 TEST_MODEL_REVISION_A,
                 refreshed_at + BINDINGS_FRESHNESS_TTL,
             )
+            .into_result()
             .is_ok());
 
         let lower = BindingsSnapshot {
@@ -1854,14 +1848,42 @@ mod tests {
         assert!(cache
             .apply(changed_same_revision, refreshed_at + Duration::from_secs(1))
             .is_err());
+        assert!(
+            cache
+                .current_binding(
+                    TEST_MODEL_A,
+                    TEST_MODEL_REVISION_A,
+                    refreshed_at + BINDINGS_FRESHNESS_TTL,
+                )
+                .into_result()
+                .is_ok(),
+            "rejected refreshes must leave the last successful binding usable through its TTL"
+        );
         assert_eq!(
-            cache.current_binding(
-                TEST_MODEL_A,
-                TEST_MODEL_REVISION_A,
-                refreshed_at + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
-            ),
+            cache
+                .current_binding(
+                    TEST_MODEL_A,
+                    TEST_MODEL_REVISION_A,
+                    refreshed_at + BINDINGS_FRESHNESS_TTL + Duration::from_millis(1),
+                )
+                .into_result(),
             Err(Reject::BindingsUnavailable),
             "rejected refreshes must not renew binding freshness"
+        );
+    }
+
+    #[test]
+    fn binding_refresh_backoff_grows_caps_and_resets_after_success() {
+        let expected = [3, 6, 12, 24, 35, 35, 35];
+        for (consecutive_failures, seconds) in (1_u32..=7).zip(expected) {
+            assert_eq!(
+                next_delay(consecutive_failures, 0.0),
+                Duration::from_secs(seconds),
+            );
+        }
+        assert_eq!(
+            next_delay(5, 1.0),
+            Duration::from_secs(43) + Duration::from_millis(750),
         );
     }
 
@@ -1932,28 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cloudtrail_selector_type_confusion_and_unknown_capture_fields() {
-        for field in [
-            r#""stream":"false""#,
-            r#""max_tokens":"32""#,
-            r#""metadata":{"user_id":"buyer"}"#,
-            r#""mcp_servers":[]"#,
-            r#""container":{"id":"remote"}"#,
-            r#""unknown_feature":true"#,
-        ] {
-            let body = format!(
-                r#"{{"model":"{TEST_MODEL_A}","max_tokens":32,"messages":[{{"role":"user","content":"hello"}}],{field}}}"#
-            );
-            assert_eq!(
-                prepare_request_body(body.as_bytes()),
-                Err(Reject::InvalidBody),
-                "{field}"
-            );
-        }
-    }
-
-    #[test]
-    fn preserves_client_side_tool_workflows_and_inline_media_semantically() {
+    fn prepares_client_side_tool_workflows_and_inline_media_unchanged() {
         let value = json!({
             "model": TEST_MODEL_A,
             "max_tokens": 1024,
@@ -1973,37 +1974,9 @@ mod tests {
             ]
         });
         let bytes = serde_json::to_vec(&value).expect("json");
-        let (rewritten, stream) = prepare_request_body(&bytes).expect("tool workflow");
-        assert_eq!(rewritten["model"], TEST_MODEL_A);
-        assert_eq!(rewritten["messages"], value["messages"]);
-        assert_eq!(rewritten["tools"], value["tools"]);
-        assert_eq!(rewritten["system"], value["system"]);
-        assert!(stream);
-    }
-
-    #[test]
-    fn rejects_server_side_tools_and_external_or_file_media() {
-        let bodies = [
-            r#"{"type":"web_search_20250305","name":"search","input_schema":{"type":"object"}}"#,
-            r#"{"type":"mcp_toolset","mcp_servers":[]}"#,
-        ];
-        for tool in bodies {
-            let body = format!("{{\"model\":\"{TEST_MODEL_A}\",\"max_tokens\":32,\"tools\":[{tool}],\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}]}}" );
-            assert_eq!(
-                prepare_request_body(body.as_bytes()),
-                Err(Reject::InvalidBody)
-            );
-        }
-        for source in [
-            r#"{"type":"url","url":"https://example.invalid/prompt.pdf"}"#,
-            r#"{"type":"file_id","file_id":"file_123"}"#,
-        ] {
-            let body = format!("{{\"model\":\"{TEST_MODEL_A}\",\"max_tokens\":32,\"messages\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"image\",\"source\":{source}}}]}}]}}" );
-            assert_eq!(
-                prepare_request_body(body.as_bytes()),
-                Err(Reject::InvalidBody)
-            );
-        }
+        let prepared = prepare_request_body(&bytes).expect("tool workflow");
+        assert_eq!(Value::Object(prepared.fields), value);
+        assert!(prepared.stream_response);
     }
 
     #[test]
@@ -2029,9 +2002,9 @@ mod tests {
             (Reject::Upstream, "upstream_response_invalid", None),
             (Reject::UpstreamTransport, "upstream_transport_failed", None),
             (
-                Reject::UpstreamHttp(403),
+                Reject::UpstreamHttp(503),
                 "upstream_http_rejected",
-                Some(403),
+                Some(503),
             ),
             (
                 Reject::ModelIdentityMismatch,
@@ -2051,6 +2024,15 @@ mod tests {
             );
         }
         assert_eq!(Reject::InvalidBody.upstream_diagnostic(), None);
+        let invalid_body = Reject::InvalidBody.into_response();
+        assert_eq!(invalid_body.status(), StatusCode::BAD_REQUEST);
+        let invalid_body = to_bytes(invalid_body.into_body(), 4096)
+            .await
+            .expect("invalid-body response");
+        assert_eq!(
+            invalid_body.as_ref(),
+            br#"{"error":{"type":"invalid_request_error","message":"Bedrock Messages body is invalid"}}"#
+        );
         assert_eq!(
             canonicalize_response_identity(
                 br#"{"content":[]}"#,
@@ -2076,7 +2058,7 @@ mod tests {
                 .expect("HTTP response"),
         );
         assert_eq!(
-            read_bounded_response(response).await,
+            read_bounded_body(response, MAX_RESPONSE_BODY).await,
             Err(Reject::UpstreamTransport)
         );
         assert!(matches!(
@@ -2090,14 +2072,208 @@ mod tests {
         let binding = test_bindings_payload().bindings[TEST_MODEL_A].clone();
         let upstream = reqwest::Response::from(
             Response::builder()
-                .status(403)
+                .status(503)
                 .body("private provider error details")
                 .expect("HTTP response"),
         );
         let failure = finish_upstream_response(upstream, &binding, false)
             .await
             .expect_err("upstream rejection");
-        assert_eq!(failure, Reject::UpstreamHttp(403));
+        assert_eq!(failure, Reject::UpstreamHttp(503));
+    }
+
+    struct Relayed {
+        status: StatusCode,
+        retry_after: Option<String>,
+        error_type: String,
+        body: String,
+    }
+
+    async fn relay_upstream_error(
+        status: u16,
+        headers: &[(&'static str, &'static str)],
+        body: &'static str,
+        streaming: bool,
+    ) -> Relayed {
+        let headers = headers.to_vec();
+        let upstream_app = Router::new().route(
+            "/anthropic/v1/messages",
+            post(move || async move {
+                let mut response = Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "application/json");
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response.body(Body::from(body)).expect("upstream response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task: JoinHandle<()> = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.expect("upstream");
+        });
+        let state = BedrockMantleState::for_test(
+            &format!("http://{address}/anthropic/v1/messages"),
+            "Bearer configured-only",
+        );
+        let request_body = if streaming {
+            VALID_BODY.replace("\"max_tokens\"", "\"stream\":true,\"max_tokens\"")
+        } else {
+            VALID_BODY.to_owned()
+        };
+        let response = handle_request(
+            State(AppState(state)),
+            request("/v1/messages", &request_body),
+        )
+        .await;
+        upstream_task.abort();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .map(|value| value.to_str().expect("ASCII Retry-After").to_owned());
+        let raw = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("error body");
+        let value: Value = serde_json::from_slice(&raw).expect("JSON error body");
+        Relayed {
+            status,
+            retry_after,
+            error_type: value["error"]["type"].as_str().expect("type").to_owned(),
+            body: String::from_utf8(raw.to_vec()).expect("UTF-8 body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_throttle_is_relayed_as_a_429_with_only_a_numeric_provider_hint() {
+        for (headers, expected_hint, streaming) in [
+            (&[("retry-after", "7")][..], Some("7"), false),
+            (&[("retry-after", "7")][..], Some("7"), true),
+            (&[][..], None, false),
+            (
+                &[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")][..],
+                None,
+                false,
+            ),
+            (&[("retry-after", "-3")][..], None, false),
+            (
+                &[("x-amzn-errortype", "ThrottlingException")][..],
+                None,
+                false,
+            ),
+        ] {
+            let relayed = relay_upstream_error(
+                429,
+                headers,
+                r#"{"message":"Too many requests for account 123456789012"}"#,
+                streaming,
+            )
+            .await;
+            assert_eq!(relayed.status, StatusCode::TOO_MANY_REQUESTS, "{headers:?}");
+            assert_eq!(relayed.retry_after.as_deref(), expected_hint, "{headers:?}");
+            assert_eq!(relayed.error_type, "rate_limit_error");
+            assert!(!relayed.body.contains("123456789012"));
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_credential_failures_keep_their_status_and_read_as_an_account_failure() {
+        let aws_denial = r#"{"message":"User: arn:aws:iam::123456789012:user/miner is not authorized to perform: bedrock:InvokeModel"}"#;
+        for (status, expected, error_type) in [
+            (401, StatusCode::UNAUTHORIZED, "authentication_error"),
+            (403, StatusCode::FORBIDDEN, "permission_error"),
+        ] {
+            let relayed = relay_upstream_error(status, &[], aws_denial, false).await;
+            assert_eq!(relayed.status, expected);
+            assert_eq!(relayed.error_type, error_type);
+            assert!(relayed.body.contains("invalid_api_key"));
+            assert!(!relayed.body.contains("arn:aws"));
+            assert!(!relayed.body.contains("123456789012"));
+            assert_eq!(relayed.retry_after, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_request_errors_stay_buyer_errors_without_provider_text() {
+        let too_long = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let relayed = relay_upstream_error(400, &[], too_long, false).await;
+        assert_eq!(relayed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(relayed.error_type, "invalid_request_error");
+        assert!(relayed.body.contains("prompt is too long"));
+        assert!(!relayed.body.contains("250000"));
+
+        let invalid = r#"{"message":"messages.0.content: field required"}"#;
+        let relayed = relay_upstream_error(400, &[], invalid, false).await;
+        assert_eq!(relayed.status, StatusCode::BAD_REQUEST);
+        assert_eq!(relayed.error_type, "invalid_request_error");
+        assert!(!relayed.body.contains("prompt is too long"));
+        assert!(!relayed.body.contains("field required"));
+
+        let relayed = relay_upstream_error(413, &[], "{}", false).await;
+        assert_eq!(relayed.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(relayed.error_type, "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn upstream_server_and_worker_side_failures_stay_502() {
+        for status in [404, 408, 424, 500, 503, 529] {
+            let relayed = relay_upstream_error(
+                status,
+                &[("retry-after", "7")],
+                r#"{"message":"private provider details"}"#,
+                false,
+            )
+            .await;
+            assert_eq!(relayed.status, StatusCode::BAD_GATEWAY, "{status}");
+            assert_eq!(relayed.error_type, "api_error");
+            assert_eq!(relayed.retry_after, None, "{status}");
+            assert!(!relayed.body.contains("private provider details"));
+        }
+    }
+
+    #[tokio::test]
+    async fn public_bodies_honour_the_gateway_drain_and_saturation_contract() {
+        let credential = [Reject::UpstreamUnauthorized, Reject::UpstreamForbidden];
+        let every_other = [
+            Reject::Method,
+            Reject::Path,
+            Reject::Header,
+            Reject::BodyTooLarge,
+            Reject::InvalidBody,
+            Reject::UnsupportedModel,
+            Reject::BindingRevision,
+            Reject::BindingsUnavailable,
+            Reject::Upstream,
+            Reject::UpstreamTransport,
+            Reject::UpstreamHttp(503),
+            Reject::UpstreamThrottled {
+                retry_after_secs: Some(7),
+            },
+            Reject::UpstreamInvalidRequest {
+                prompt_too_long: true,
+            },
+            Reject::UpstreamInvalidRequest {
+                prompt_too_long: false,
+            },
+            Reject::UpstreamTooLarge,
+            Reject::ModelIdentityMismatch,
+        ];
+        let body = |failure: Reject| async move {
+            let raw = to_bytes(failure.into_response().into_body(), 4096)
+                .await
+                .expect("error body");
+            String::from_utf8(raw.to_vec()).expect("UTF-8 body")
+        };
+        for failure in credential {
+            let text = body(failure).await;
+            assert!(signals_drain(&text), "{failure:?}");
+        }
+        for failure in every_other {
+            let text = body(failure).await;
+            assert!(!signals_drain(&text), "{failure:?}");
+            assert!(!text.contains("miner saturated"), "{failure:?}");
+        }
     }
 
     #[test]
@@ -2145,6 +2321,85 @@ mod tests {
         assert!(canonical.contains(TEST_MODEL_A));
         assert!(!canonical.contains(TEST_RESPONSE_MODEL_A));
         assert!(rest.next().await.is_none());
+
+        let future_events = concat!(
+            "event: future_event\ndata: {\"type\":\"future_event\",\"extra\":true}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a-provider-echo\",\"future_field\":true}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"future_content_block\",\"future_field\":true}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"future_delta\",\"future_field\":true}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (preamble, rest) = validate_stream_identity(
+            in_chunks(future_events.as_bytes(), 9),
+            TEST_RESPONSE_MODEL_A,
+            TEST_MODEL_A,
+        )
+        .await
+        .expect("unknown events pass after the raw model identity is verified");
+        let chunks = stream::once(async move { Ok::<Bytes, io::Error>(preamble) })
+            .chain(rest)
+            .boxed();
+        let collected = guard_stream(chunks).collect::<Vec<_>>().await;
+        let mut forwarded = Vec::new();
+        for chunk in collected {
+            forwarded.extend_from_slice(chunk.expect("valid future event stream").as_ref());
+        }
+        let forwarded = String::from_utf8(forwarded).expect("UTF-8 stream");
+        assert!(forwarded.contains("event: future_event\n"));
+        assert!(forwarded.contains("\"future_field\":true"));
+        assert!(forwarded.contains("future_content_block"));
+        assert!(forwarded.contains("future_delta"));
+        assert!(forwarded.contains(TEST_MODEL_A));
+        assert!(!forwarded.contains(TEST_RESPONSE_MODEL_A));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_identity_rejects_known_events_before_start_without_waiting() {
+        for event in [
+            "error",
+            "message_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+        ] {
+            let frame = format!("event: {event}\ndata: {{\"type\":\"{event}\"}}\n\n");
+            let source = stream::iter([Ok(Bytes::from(frame))])
+                .chain(stream::pending())
+                .boxed();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                validate_stream_identity(source, TEST_RESPONSE_MODEL_A, TEST_MODEL_A),
+            )
+            .await;
+            assert!(matches!(result, Ok(Err(Reject::Upstream))), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_identity_rejects_malformed_preamble_before_valid_start() {
+        let start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"test-model-a-provider-echo\"}}\n\n";
+        for frame in [
+            "event: future_event\ndata: not-json\n\n",
+            "event: future_event\ndata: {\"type\":\"other_event\"}\n\n",
+            "event: future_event\ndata: {\"type\":\"future_event\",\"type\":\"future_event\"}\n\n",
+            "event: future_event\n\n",
+            "event: message_start\ndata:\n\n",
+            "data:\n\n",
+        ] {
+            let source = stream::iter([
+                Ok(Bytes::copy_from_slice(frame.as_bytes())),
+                Ok(Bytes::from_static(start)),
+            ])
+            .boxed();
+            assert!(
+                matches!(
+                    validate_stream_identity(source, TEST_RESPONSE_MODEL_A, TEST_MODEL_A).await,
+                    Err(Reject::Upstream)
+                ),
+                "{frame}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2435,9 +2690,7 @@ mod tests {
         assert!(!log.contains("AAAA"), "log carries stream bytes: {log}");
 
         let unknown = stream_with_frame(b"event: unknown\ndata: {\"type\":\"unknown\"}\n\n");
-        let log = guard_log(&unknown).await;
-        assert!(log.contains("reason=\"invalid_event\""), "log: {log}");
-        assert!(!log.contains("unknown"), "log carries stream bytes: {log}");
+        assert_eq!(guard_log(&unknown).await, "");
 
         let mut after_terminal = stream_with_frame(&[]);
         after_terminal.extend_from_slice(b"event: ping\ndata: {\"type\":\"ping\"}\n\n");
@@ -2501,7 +2754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_proxy_rejects_query_path_and_workspace_before_upstream() {
+    async fn local_proxy_rejects_query_path_and_ignores_unforwarded_workspace_header() {
         let (state, calls) = test_state().await;
         let response = handle_request(
             State(AppState(state.clone())),
@@ -2514,8 +2767,30 @@ mod tests {
             .headers_mut()
             .insert("anthropic-workspace-id", HeaderValue::from_static("other"));
         let response = handle_request(State(AppState(state)), workspace).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unbound_models_and_oversized_requests_are_rejected_before_dispatch() {
+        let (state, calls) = test_state().await;
+        let registry_snapshot = test_bindings_payload();
+        let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+        let state = registry.attach(state);
+        let unbound = VALID_BODY.replace(TEST_MODEL_A, "unbound-model");
+        let response = handle_request(
+            State(AppState(state.clone())),
+            request("/v1/messages", &unbound),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let oversized = request("/v1/messages", VALID_BODY)
+            .map(|_| Body::from(vec![b' '; MAX_REQUEST_BODY + 1]));
+        let response = handle_request(State(AppState(state)), oversized).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(registry.calls(), 1);
     }
 
     #[tokio::test]
@@ -2562,6 +2837,49 @@ mod tests {
                 );
                 request
             }),
+            ("empty beta token", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request.headers_mut().insert(
+                    "anthropic-beta",
+                    HeaderValue::from_static("future-feature,,interleaved-thinking-2025-05-14"),
+                );
+                request
+            }),
+            ("invalid beta token", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request
+                    .headers_mut()
+                    .insert("anthropic-beta", HeaderValue::from_static("future feature"));
+                request
+            }),
+            ("duplicate beta header", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request
+                    .headers_mut()
+                    .insert("anthropic-beta", HeaderValue::from_static("future-feature"));
+                request.headers_mut().append(
+                    "anthropic-beta",
+                    HeaderValue::from_static("another-feature"),
+                );
+                request
+            }),
+            ("non-visible beta byte", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                request.headers_mut().insert(
+                    "anthropic-beta",
+                    HeaderValue::from_bytes(b"future-\xff").expect("opaque header byte"),
+                );
+                request
+            }),
+            ("overlong beta header", {
+                let mut request = request("/v1/messages", VALID_BODY);
+                let value = format!("future-{}", "x".repeat(MAX_ANTHROPIC_BETA_HEADER_BYTES));
+                request.headers_mut().insert(
+                    "anthropic-beta",
+                    HeaderValue::from_str(&value).expect("long ASCII header"),
+                );
+                request
+            }),
         ];
         for (label, request) in cases {
             let response = handle_request(State(AppState(state.clone())), request).await;
@@ -2571,38 +2889,484 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_model_binding_revision_is_rejected_before_upstream_dispatch() {
-        let (state, calls) = test_state().await;
-        let mut request = request("/v1/messages", VALID_BODY);
-        request
+    async fn lower_model_binding_revision_is_rejected_without_refresh() {
+        for expired in [false, true] {
+            let (state, upstream_calls) = test_state().await;
+            if expired {
+                expire_bindings(&state).await;
+            }
+            let registry = MockBindingRegistry::start(&test_bindings_payload(), false).await;
+            let state = registry.attach(state);
+            let request = request_with_revision("/v1/messages", VALID_BODY, "6");
+            let response = handle_request(State(AppState(state)), request).await;
+
+            assert_eq!(response.status(), StatusCode::CONFLICT, "expired={expired}");
+            assert_eq!(registry.calls(), 0, "expired={expired}");
+            assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_without_a_snapshot_joins_the_initial_refresh() {
+        let (state, upstream_calls) = test_state().await;
+        *state.bindings.write().await = BindingCache::default();
+        let registry = MockBindingRegistry::start(&test_bindings_payload(), true).await;
+        let state = registry.attach(state);
+        let response = handle_request(State(AppState(state)), request("/v1/messages", VALID_BODY));
+        tokio::pin!(response);
+        assert!(futures_util::poll!(&mut response).is_pending());
+        registry.wait_for_call().await;
+        assert!(futures_util::poll!(&mut response).is_pending());
+        registry.release(1);
+
+        assert_eq!(response.await.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn newer_model_binding_revision_refreshes_before_dispatch() {
+        let (state, upstream_calls) = test_state().await;
+        let registry_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+        let state = registry.attach(state);
+        let request = request_with_revision("/v1/messages", VALID_BODY, "8");
+
+        let response = handle_request(State(AppState(state)), request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn request_joins_one_startable_refresh_and_is_served() {
+        let (state, upstream_calls) = test_state().await;
+        let registry_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&registry_snapshot, true).await;
+        let state = registry.attach(state);
+        let response = tokio::spawn(handle_request(
+            State(AppState(state)),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        ));
+
+        registry.wait_for_call().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !response.is_finished(),
+            "request waits for the in-flight fetch"
+        );
+        assert_eq!(registry.calls(), 1);
+        registry.release(1);
+
+        assert_eq!(response.await.expect("request").status(), StatusCode::OK);
+        assert_eq!(
+            registry.calls(),
+            1,
+            "request must wait for exactly one fetch"
+        );
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshed_binding_revision_must_match_exactly() {
+        for (row_revision, label) in [
+            (TEST_MODEL_REVISION_A, "registry remains behind"),
+            (TEST_MODEL_REVISION_A + 2, "registry advances past request"),
+        ] {
+            let (state, upstream_calls) = test_state().await;
+            let registry_snapshot = if row_revision == TEST_MODEL_REVISION_A {
+                test_bindings_payload()
+            } else {
+                snapshot_with_model_revision(row_revision)
+            };
+            let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+            let state = registry.attach(state);
+            let request = request_with_revision("/v1/messages", VALID_BODY, "8");
+
+            let response = handle_request(State(AppState(state)), request).await;
+
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{label}");
+            assert_eq!(registry.calls(), 1, "{label}");
+            assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_newer_revisions_share_one_refresh() {
+        let (state, upstream_calls) = test_state().await;
+        let registry_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&registry_snapshot, true).await;
+        let state = registry.attach(state);
+        let requests = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut request = request("/v1/messages", VALID_BODY);
+                    request
+                        .headers_mut()
+                        .insert(MODEL_BINDING_REVISION_HEADER, HeaderValue::from_static("8"));
+                    handle_request(State(AppState(state)), request).await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        registry.wait_for_call().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(registry.calls(), 1);
+        registry.release(8);
+        for request in requests {
+            assert_eq!(
+                request.await.expect("concurrent request").status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_waiter_rechecks_after_its_fetch_even_if_another_fetch_completed() {
+        let clock_guard = paused_clock_guard();
+        let (state, upstream_calls) = test_state().await;
+        let registry = MockBindingRegistry::start(&test_bindings_payload(), true).await;
+        let state = registry.attach(state);
+        let mut status = state.refresh_status.subscribe();
+        let observed = status.borrow_and_update().generation();
+        let delayed = handle_request(
+            State(AppState(state.clone())),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        );
+        tokio::pin!(delayed);
+        assert!(futures_util::poll!(&mut delayed).is_pending());
+        registry.wait_for_call().await;
+        registry.release(1);
+        let _ = wait_for_generation(&mut status, observed).await;
+
+        // Leave this request unpolled while another caller completes a refresh.
+        tokio::time::advance(BINDINGS_ON_DEMAND_MIN_INTERVAL).await;
+        let next = tokio::spawn(handle_request(
+            State(AppState(state)),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        ));
+        registry.wait_for_call().await;
+        registry.release(1);
+        assert_eq!(
+            next.await.expect("second request").status(),
+            StatusCode::CONFLICT
+        );
+
+        let polled = futures_util::poll!(&mut delayed);
+        assert!(
+            matches!(polled, std::task::Poll::Ready(ref response) if response.status() == StatusCode::CONFLICT),
+            "a completed fetch must release its waiter even after later completions"
+        );
+        assert_eq!(registry.calls(), 2);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        clock_guard.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_does_not_cancel_the_shared_refresh() {
+        let (state, upstream_calls) = test_state().await;
+        let snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        let registry = MockBindingRegistry::start(&snapshot, true).await;
+        let state = registry.attach(state);
+        let mut first = request("/v1/messages", VALID_BODY);
+        first
             .headers_mut()
             .insert(MODEL_BINDING_REVISION_HEADER, HeaderValue::from_static("8"));
+        let first_state = state.clone();
+        let cancelled = tokio::spawn(handle_request(State(AppState(first_state)), first));
+        registry.wait_for_call().await;
+        cancelled.abort();
+        assert!(cancelled
+            .await
+            .expect_err("cancelled request")
+            .is_cancelled());
+
+        let mut second = request("/v1/messages", VALID_BODY);
+        second
+            .headers_mut()
+            .insert(MODEL_BINDING_REVISION_HEADER, HeaderValue::from_static("8"));
+        let response = handle_request(State(AppState(state)), second);
+        tokio::pin!(response);
+        assert!(futures_util::poll!(&mut response).is_pending());
+        registry.release(1);
+
+        assert_eq!(response.await.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_refreshes_obey_backoff_and_reset_after_recovery() {
+        let (state, _) = test_state().await;
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let mut status = state.refresh_status.subscribe();
+        let mut observed = status.borrow_and_update().generation();
+        state.start_binding_refresher();
+
+        registry.wait_for_call().await;
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 1);
+        let first_minimum = next_delay(1, 0.0);
+        let first_maximum = next_delay(1, 1.0);
+        tokio::time::advance(first_minimum.saturating_sub(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 1);
+        tokio::time::advance(
+            first_maximum
+                .saturating_sub(first_minimum)
+                .saturating_add(Duration::from_millis(1)),
+        )
+        .await;
+        registry.wait_for_call().await;
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 2);
+
+        *registry.body.write().await = snapshot_json(&test_bindings_payload());
+        let second_minimum = next_delay(2, 0.0);
+        let second_maximum = next_delay(2, 1.0);
+        tokio::time::advance(second_minimum.saturating_sub(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 2);
+        tokio::time::advance(
+            second_maximum
+                .saturating_sub(second_minimum)
+                .saturating_add(Duration::from_millis(1)),
+        )
+        .await;
+        registry.wait_for_call().await;
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 3);
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 3);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        registry.wait_for_call().await;
+        let _ = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_initial_refresh_retries_after_backoff_without_dispatch() {
+        let (state, upstream_calls) = test_state().await;
+        *state.bindings.write().await = BindingCache::default();
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let mut status = state.refresh_status.subscribe();
+        let mut observed = status.borrow_and_update().generation();
+
+        let response = tokio::spawn(handle_request(
+            State(AppState(state.clone())),
+            request("/v1/messages", VALID_BODY),
+        ));
+        registry.wait_for_call().await;
+        let response = response.await.expect("initial request");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        observed = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let minimum = next_delay(1, 0.0);
+        let maximum = next_delay(1, 1.0);
+        tokio::time::advance(minimum.saturating_sub(Duration::from_millis(1))).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 1);
+        tokio::time::advance(
+            maximum
+                .saturating_sub(minimum)
+                .saturating_add(Duration::from_millis(1)),
+        )
+        .await;
+        registry.wait_for_call().await;
+        let _ = wait_for_generation(&mut status, observed).await;
+        assert_eq!(registry.calls(), 2);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_demand_refresh_waits_out_minimum_gap_and_serves_new_revision() {
+        let clock_guard = paused_clock_guard();
+        let (state, upstream_calls) = test_state().await;
+        let registry = MockBindingRegistry::start(&test_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let first = handle_request(
+            State(AppState(state.clone())),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        );
+        assert_eq!(first.await.status(), StatusCode::CONFLICT);
+        assert_eq!(registry.calls(), 1);
+
+        let newer_snapshot = snapshot_with_model_revision(TEST_MODEL_REVISION_A + 1);
+        *registry.body.write().await = snapshot_json(&newer_snapshot);
+        let second = handle_request(
+            State(AppState(state)),
+            request_with_revision("/v1/messages", VALID_BODY, "8"),
+        );
+        tokio::pin!(second);
+        assert!(futures_util::poll!(&mut second).is_pending());
+        tokio::time::advance(
+            BINDINGS_ON_DEMAND_MIN_INTERVAL.saturating_sub(Duration::from_millis(1)),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.calls(), 1);
+        assert!(futures_util::poll!(&mut second).is_pending());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        registry.wait_for_call().await;
+        let response = second.await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 2);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        clock_guard.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_revision_rejects_immediately_during_failure_backoff() {
+        let clock_guard = paused_clock_guard();
+        for (kind, expected_status, expired, model, revision) in [
+            (
+                "newer revision",
+                StatusCode::CONFLICT,
+                false,
+                TEST_MODEL_A,
+                "8",
+            ),
+            (
+                "unknown model",
+                StatusCode::BAD_REQUEST,
+                false,
+                "unknown-model",
+                "7",
+            ),
+            (
+                "expired snapshot",
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                TEST_MODEL_A,
+                "7",
+            ),
+        ] {
+            let (state, upstream_calls) = test_state().await;
+            if expired {
+                expire_bindings(&state).await;
+            }
+            let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+            let state = registry.attach(state);
+            let body = VALID_BODY.replace(TEST_MODEL_A, model);
+            let first = handle_request(
+                State(AppState(state.clone())),
+                request_with_revision("/v1/messages", &body, revision),
+            );
+            assert_eq!(first.await.status(), expected_status, "{kind}");
+            assert_eq!(registry.calls(), 1, "{kind}");
+
+            let second = handle_request(
+                State(AppState(state)),
+                request_with_revision("/v1/messages", &body, revision),
+            );
+            tokio::pin!(second);
+            let polled = futures_util::poll!(&mut second);
+            assert!(polled.is_ready(), "{kind} must reject immediately");
+            let response = match polled {
+                std::task::Poll::Ready(response) => Some(response),
+                std::task::Poll::Pending => None,
+            }
+            .expect("an immediately rejected request must be ready");
+            assert_eq!(response.status(), expected_status, "{kind}");
+            assert_eq!(registry.calls(), 1, "{kind} must not start another fetch");
+            assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        clock_guard.abort();
+    }
+
+    #[tokio::test]
+    async fn newly_approved_unknown_model_refreshes_before_dispatch() {
+        const MODEL_B: &str = "future-model-2027-01";
+        const SELECTOR_B: &str = "anthropic.future-model-2027-01-v1";
+        const ECHO_B: &str = "future-model-2027-01-provider-echo";
+
+        let (state, upstream_calls) = test_state_with_response(ECHO_B).await;
+        let mut registry_snapshot = test_bindings_payload();
+        registry_snapshot.revision += 1;
+        registry_snapshot.bindings.insert(
+            MODEL_B.to_owned(),
+            ModelBinding {
+                provider: "anthropic".to_owned(),
+                model: MODEL_B.to_owned(),
+                upstream_model: SELECTOR_B.to_owned(),
+                response_model: ECHO_B.to_owned(),
+                revision: 11,
+            },
+        );
+        let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+        let state = registry.attach(state);
+        let body = VALID_BODY.replace(TEST_MODEL_A, MODEL_B);
+        let mut request = request("/v1/messages", &body);
+        request.headers_mut().insert(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("11"),
+        );
+
         let response = handle_request(State(AppState(state)), request).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body");
+        let value: Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(value["model"], MODEL_B);
     }
 
     #[tokio::test]
     async fn expired_binding_snapshot_fails_closed_before_upstream_dispatch() {
         let (state, calls) = test_state().await;
-        {
-            let mut cache = state.bindings.write().await;
-            let current = cache.current.as_mut().expect("test snapshot");
-            current.fetched_at = Instant::now()
-                .checked_sub(BINDINGS_FRESHNESS_TTL)
-                .and_then(|fetched_at| fetched_at.checked_sub(Duration::from_secs(1)))
-                .expect("test expiry instant is safely in the past");
-        }
+        expire_bindings(&state).await;
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
         let response =
             handle_request(State(AppState(state)), request("/v1/messages", VALID_BODY)).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(registry.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_on_demand_refresh_does_not_restore_expired_bindings() {
+        let (state, upstream_calls) = test_state().await;
+        expire_bindings(&state).await;
+        let registry = MockBindingRegistry::start(&invalid_bindings_payload(), false).await;
+        let state = registry.attach(state);
+        let request = request_with_revision("/v1/messages", VALID_BODY, "8");
+
+        let response = handle_request(State(AppState(state)), request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(registry.calls(), 1);
+        assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn binding_changes_during_body_collection_reject_before_dispatch() {
         for change in ["revision", "removal", "expiry"] {
             let (state, calls) = test_state().await;
+            let mut revoked = test_bindings_payload();
+            revoked.revision += 1;
+            revoked.bindings.clear();
+            let registry_snapshot = if change == "expiry" {
+                invalid_bindings_payload()
+            } else {
+                revoked
+            };
+            let registry = MockBindingRegistry::start(&registry_snapshot, false).await;
+            let state = registry.attach(state);
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let body = Body::from_stream(stream::once(async move {
@@ -2651,6 +3415,11 @@ mod tests {
                 calls.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 "{change}"
+            );
+            assert_eq!(
+                registry.calls(),
+                usize::from(change != "revision"),
+                "{change} must use the mock registry when refreshing"
             );
         }
     }
@@ -2743,29 +3512,8 @@ mod tests {
             ]),
         };
 
-        let snapshot_body = Arc::new(RwLock::new(snapshot_json(&initial)));
-        let registry_body = snapshot_body.clone();
-        let registry_app = Router::new().route(
-            "/model-bindings/bedrock",
-            get(move || {
-                let registry_body = registry_body.clone();
-                async move {
-                    let body = registry_body.read().await.clone();
-                    ([(CONTENT_TYPE, "application/json")], body)
-                }
-            }),
-        );
-        let registry_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("registry listener");
-        let registry_addr = registry_listener.local_addr().expect("registry address");
-        let registry_task = tokio::spawn(async move {
-            axum::serve(registry_listener, registry_app)
-                .await
-                .expect("registry");
-        });
-        let state =
-            state.with_test_registry_url(&format!("http://{registry_addr}/model-bindings/bedrock"));
+        let registry = MockBindingRegistry::start(&initial, false).await;
+        let state = registry.attach(state);
         state
             .refresh_bindings()
             .await
@@ -2786,7 +3534,7 @@ mod tests {
         let adapter_url = format!("http://{adapter_addr}/v1/messages");
         let client = Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
             .build()
             .expect("adapter test client");
 
@@ -2800,7 +3548,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        *snapshot_body.write().await = snapshot_json(&added_snapshot);
+        *registry.body.write().await = snapshot_json(&added_snapshot);
         state
             .refresh_bindings()
             .await
@@ -2847,8 +3595,10 @@ mod tests {
                 initial.bindings[TEST_MODEL_A].clone(),
             )]),
         };
-        *snapshot_body.write().await = snapshot_json(&revoked_snapshot);
+        *registry.body.write().await = snapshot_json(&revoked_snapshot);
         state.refresh_bindings().await.expect("revoke future model");
+        tokio::time::pause();
+        tokio::time::advance(BINDINGS_ON_DEMAND_MIN_INTERVAL).await;
         let (body, revision) = request_b(false, "11");
         let response = test_adapter_request(&client, &adapter_url, &body, revision).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2870,7 +3620,7 @@ mod tests {
                 ),
             ]),
         };
-        *snapshot_body.write().await = snapshot_json(&readded_snapshot);
+        *registry.body.write().await = snapshot_json(&readded_snapshot);
         state.refresh_bindings().await.expect("new row revision");
         let (body, revision) = request_b(false, "11");
         let response = test_adapter_request(&client, &adapter_url, &body, revision).await;
@@ -2878,7 +3628,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 3);
 
         adapter_task.abort();
-        registry_task.abort();
         upstream_task.abort();
     }
 
@@ -2952,7 +3701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_sends_only_fixed_headers_and_rewrites_only_model() {
+    async fn proxy_forwards_anthropic_beta_and_rewrites_only_model() {
         let received = std::sync::Arc::new(std::sync::Mutex::new(None));
         let capture = received.clone();
         let upstream_app = Router::new().route(
@@ -2989,6 +3738,21 @@ mod tests {
         request
             .headers_mut()
             .insert("x-private", HeaderValue::from_static("must-not-forward"));
+        request
+            .headers_mut()
+            .insert("x-api-key", HeaderValue::from_static("buyer-api-key"));
+        request.headers_mut().insert(
+            "anthropic-beta",
+            HeaderValue::from_static("future-feature, interleaved-thinking-2025-05-14"),
+        );
+        request.headers_mut().insert(
+            "anthropic-workspace-id",
+            HeaderValue::from_static("buyer-workspace"),
+        );
+        request.headers_mut().insert(
+            "x-amzn-bedrock-session-token",
+            HeaderValue::from_static("buyer-session-token"),
+        );
         let response = handle_request(State(AppState(state)), request).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -3023,26 +3787,352 @@ mod tests {
             Some(ANTHROPIC_VERSION)
         );
         assert!(headers.get("x-private").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        assert_eq!(
+            headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("future-feature, interleaved-thinking-2025-05-14")
+        );
+        assert!(headers.get("anthropic-workspace-id").is_none());
+        assert!(headers.get("x-amzn-bedrock-session-token").is_none());
         assert!(headers.get(EXECUTION_POLICY_HEADER).is_none());
         upstream_task.abort();
     }
 
+    #[tokio::test]
+    async fn opus_55_adaptive_summarized_body_and_effort_are_forwarded_with_bound_model() {
+        const MODEL: &str = "claude-opus-5-5";
+        const SELECTOR: &str = "anthropic.claude-opus-5-5-v1";
+        const RESPONSE_MODEL: &str = "claude-opus-5-5-bedrock-echo";
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = received.clone();
+        let upstream_app = Router::new().route(
+            "/anthropic/v1/messages",
+            post(move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let headers = request.headers().clone();
+                    let body = to_bytes(request.into_body(), MAX_REQUEST_BODY)
+                        .await
+                        .expect("body");
+                    *capture.lock().expect("capture") = Some((headers, body.to_vec()));
+                    let message_start = json!({
+                        "type": "message_start",
+                        "message": { "model": RESPONSE_MODEL },
+                    });
+                    let message_stop = json!({ "type": "message_stop" });
+                    let body = format!(
+                        "event: message_start\ndata: {message_start}\n\nevent: message_stop\ndata: {message_stop}\n\n"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .expect("stream response")
+                }
+            }),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let upstream_addr = upstream_listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app)
+                .await
+                .expect("upstream");
+        });
+        let state = BedrockMantleState::for_test(
+            &format!("http://{upstream_addr}/anthropic/v1/messages"),
+            "Bearer configured-only",
+        );
+        install_test_binding(&state, MODEL, SELECTOR, RESPONSE_MODEL, 11).await;
+
+        let mut body = json!({
+            "model": MODEL,
+            "stream": true,
+            "max_tokens": 16,
+            "thinking": { "type": "adaptive", "display": "summarized" },
+            "output_config": { "effort": "medium" },
+            "messages": [{ "role": "user", "content": "Reason about this." }]
+        });
+        let mut request = request("/v1/messages", &body.to_string());
+        request.headers_mut().insert(
+            MODEL_BINDING_REVISION_HEADER,
+            HeaderValue::from_static("11"),
+        );
+        let response = handle_request(State(AppState(state)), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), MAX_RESPONSE_BODY)
+            .await
+            .expect("stream body");
+        assert!(String::from_utf8_lossy(&response_body).contains(MODEL));
+
+        body["model"] = json!(SELECTOR);
+        let (headers, sent) = received
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("upstream request");
+        let sent: Value = serde_json::from_slice(&sent).expect("sent JSON");
+        assert_eq!(sent, body);
+        assert_eq!(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer configured-only")
+        );
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_request_fields_and_content_blocks_are_forwarded_unchanged() {
+        const SELECTOR: &str = "anthropic.test-model-a-v1";
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = received.clone();
+        let upstream_app = Router::new().route(
+            "/anthropic/v1/messages",
+            post(move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    let headers = request.headers().clone();
+                    let body = to_bytes(request.into_body(), MAX_REQUEST_BODY)
+                        .await
+                        .expect("body");
+                    *capture.lock().expect("capture") = Some((headers, body.to_vec()));
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        json!({ "model": TEST_RESPONSE_MODEL_A }).to_string(),
+                    )
+                }
+            }),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let upstream_addr = upstream_listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app)
+                .await
+                .expect("upstream");
+        });
+        let state = BedrockMantleState::for_test(
+            &format!("http://{upstream_addr}/anthropic/v1/messages"),
+            "Bearer configured-only",
+        );
+        let mut body = json!({
+            "model": TEST_MODEL_A,
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "future_content_block",
+                    "payload": { "preserve": [1, 2, 3] }
+                }]
+            }],
+            "future_top_level_field": { "preserve": true }
+        });
+        let request = request("/v1/messages", &body.to_string());
+        let response = handle_request(State(AppState(state)), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, sent) = received
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("upstream request");
+        body["model"] = json!(SELECTOR);
+        assert!(headers.get("anthropic-beta").is_none());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&sent).expect("sent JSON"),
+            body
+        );
+        upstream_task.abort();
+    }
+
+    async fn install_test_binding(
+        state: &BedrockMantleState,
+        model: &str,
+        selector: &str,
+        response_model: &str,
+        revision: u64,
+    ) {
+        let mut cache = state.bindings.write().await;
+        let mut snapshot = cache
+            .current
+            .as_ref()
+            .expect("test binding snapshot")
+            .snapshot
+            .clone();
+        snapshot.revision = revision;
+        snapshot.bindings.insert(
+            model.to_owned(),
+            ModelBinding {
+                provider: "anthropic".to_owned(),
+                model: model.to_owned(),
+                upstream_model: selector.to_owned(),
+                response_model: response_model.to_owned(),
+                revision,
+            },
+        );
+        cache.apply(snapshot, Instant::now()).expect("test binding");
+    }
+
+    fn snapshot_with_model_revision(revision: u64) -> BindingsSnapshot {
+        let mut snapshot = test_bindings_payload();
+        snapshot.revision += 1;
+        snapshot
+            .bindings
+            .get_mut(TEST_MODEL_A)
+            .expect("test binding")
+            .revision = revision;
+        snapshot
+    }
+
+    fn invalid_bindings_payload() -> BindingsSnapshot {
+        let mut snapshot = test_bindings_payload();
+        snapshot.network = "testnet".to_owned();
+        snapshot
+    }
+
+    async fn expire_bindings(state: &BedrockMantleState) {
+        let mut cache = state.bindings.write().await;
+        cache.current.as_mut().expect("test snapshot").fetched_at = Instant::now()
+            .checked_sub(BINDINGS_FRESHNESS_TTL + Duration::from_secs(1))
+            .expect("expiry instant");
+    }
+
+    fn paused_clock_guard() -> JoinHandle<()> {
+        tokio::spawn(async {
+            loop {
+                // Keep the paused clock from auto-advancing while this spinner yields.
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    async fn wait_for_generation(
+        receiver: &mut watch::Receiver<BindingRefreshStatus>,
+        previous: u64,
+    ) -> u64 {
+        loop {
+            let current = receiver.borrow_and_update().generation();
+            if current != previous {
+                return current;
+            }
+            receiver.changed().await.expect("binding refresh status");
+        }
+    }
+
+    struct MockBindingRegistry {
+        url: String,
+        body: Arc<RwLock<Vec<u8>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+        task: JoinHandle<()>,
+    }
+
+    impl MockBindingRegistry {
+        async fn start(snapshot: &BindingsSnapshot, blocked: bool) -> Self {
+            let body = Arc::new(RwLock::new(snapshot_json(snapshot)));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Semaphore::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let registry_body = body.clone();
+            let registry_calls = calls.clone();
+            let registry_entered = entered.clone();
+            let registry_release = release.clone();
+            let registry_app = Router::new().route(
+                "/model-bindings/bedrock",
+                get(move || {
+                    let body = registry_body.clone();
+                    let calls = registry_calls.clone();
+                    let entered = registry_entered.clone();
+                    let release = registry_release.clone();
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        entered.add_permits(1);
+                        if blocked {
+                            release
+                                .acquire()
+                                .await
+                                .expect("registry response release")
+                                .forget();
+                        }
+                        let body = body.read().await.clone();
+                        ([(CONTENT_TYPE, "application/json")], body)
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("registry listener");
+            let address = listener.local_addr().expect("registry address");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, registry_app)
+                    .await
+                    .expect("mock registry");
+            });
+            Self {
+                url: format!("http://{address}/model-bindings/bedrock"),
+                body,
+                calls,
+                entered,
+                release,
+                task,
+            }
+        }
+
+        fn attach(&self, state: BedrockMantleState) -> BedrockMantleState {
+            state.with_test_registry_url(&self.url)
+        }
+
+        async fn wait_for_call(&self) {
+            self.entered
+                .acquire()
+                .await
+                .expect("mock registry semaphore")
+                .forget();
+        }
+
+        fn release(&self, count: usize) {
+            self.release.add_permits(count);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for MockBindingRegistry {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     fn request(uri: &str, body: &str) -> Request<Body> {
+        request_with_revision(uri, body, "7")
+    }
+
+    fn request_with_revision(uri: &str, body: &str, revision: &str) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
             .uri(uri)
             .header(CONTENT_TYPE, "application/json")
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header(EXECUTION_POLICY_HEADER, EXACT_CANONICAL_NO_REPLAY_POLICY)
-            .header(
-                MODEL_BINDING_REVISION_HEADER,
-                TEST_MODEL_REVISION_A.to_string(),
-            )
+            .header(MODEL_BINDING_REVISION_HEADER, revision)
             .body(Body::from(body.to_owned()))
             .expect("request")
     }
 
     async fn test_state() -> (
+        BedrockMantleState,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        test_state_with_response(TEST_RESPONSE_MODEL_A).await
+    }
+
+    async fn test_state_with_response(
+        response_model: &'static str,
+    ) -> (
         BedrockMantleState,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
@@ -3054,10 +4144,8 @@ mod tests {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    (
-                        [(CONTENT_TYPE, "application/json")],
-                        r#"{"model":"test-model-a-provider-echo"}"#,
-                    )
+                    let body = json!({ "model": response_model }).to_string();
+                    ([(CONTENT_TYPE, "application/json")], body)
                 }
             }),
         );

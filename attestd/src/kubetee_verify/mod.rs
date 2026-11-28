@@ -2,14 +2,21 @@
 //!
 //! Each upstream connection to `llm.kubetee.ai` is attested before use and
 //! renewed every 10 minutes. On a new TLS 1.3 connection the proxy fetches a
-//! quote bound to a fresh nonce and verifies it: Intel DCAP chain and an
-//! `UpToDate` TCB, a TDX report with debug off, `report_data = SHA-512(nonce)`,
-//! the event log replaying to RTMR0-3, and the serving certificate's key
-//! signing the nonce. Chat requests are then sent on attested connections
-//! only, one at a time per connection.
+//! quote bound to a fresh nonce and verifies it: a `kubetee.attestation.v2`
+//! quote-bound per-boot key binding (the quote's `report_data` is
+//! `SHA-384(tag ‖ framed(pkix) ‖ framed(nonce) ‖ framed(context)) ‖ 16 zero
+//! bytes` for the in-guest generated key the response names), a keyset naming
+//! this connection's serving key and unexpired, Intel DCAP chain and an
+//! `UpToDate` TCB, a TDX report with debug off, the event log replaying to
+//! RTMR0-3, and a `key_possession` signature over the quote-bound
+//! `report_data` under the very key the quote commits. A response without the
+//! v2 binding fails closed. Chat requests are then sent on attested
+//! connections only, one at a time per connection, and never after the
+//! keyset's deadline.
 
 pub mod binding;
 pub mod evidence;
+pub mod evidence_snp;
 pub mod pool;
 
 use std::fmt;
@@ -24,7 +31,7 @@ use axum::http::header::{AUTHORIZATION, HOST};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use chrono::{DateTime, Utc};
 use dcap_qvl::collateral::CollateralClient;
-use dcap_qvl::QuoteCollateralV3;
+use dcap_qvl::policy::QuoteClaims;
 use http_body_util::{BodyExt as _, Limited};
 use hyper::body::Incoming;
 use rustls::{ClientConfig, RootCertStore};
@@ -34,7 +41,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::tee_evidence;
 use crate::upstream_proxy::{self, retry_attestation, strip_hop_by_hop, UpstreamConnection};
-use evidence::{AttestationPayload, Measurements};
+use evidence::{AttestationPayload, TeeMeasurements};
 use pool::{Lease, Limits, Pool};
 
 pub use crate::upstream_proxy::ATTESTATION_ATTEMPTS;
@@ -60,16 +67,14 @@ pub const TARGETS: [&str; 8] = [
     "z-ai/glm-5.3-flash",
     "deepseek/deepseek-v4.1-flash",
     "deepseek/deepseek-v4.1-flash-1017",
-    "mistralai/mistral-large-4",
-    "ornith/ornith-1.5-397b",
+    "moonshotai/kimi-k3",
+    "moonshotai/kimi-k3.1-pro",
     "xiaomi/mimo-v2.6-pro",
 ];
 
 /// Image models the direct `/v1/images/generations` route serves. They are
 /// listed in model discovery; chat for them is refused.
 pub const IMAGE_MODELS: [&str; 1] = ["black-forest-labs/flux.2-klein-4b"];
-/// Video models the direct `/v1/videos` route serves.
-pub const VIDEO_MODELS: [&str; 1] = ["minimax/h3"];
 
 /// Header families the supplier sets that are removed in both directions.
 const SUPPLIER_HEADER_PREFIXES: [&str; 2] = ["x-kubetee-", "x-litellm-"];
@@ -82,29 +87,31 @@ const READY_TIMEOUT: Duration = Duration::from_secs(1);
 /// only when it is done.
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// Where quote collateral and the current time come from.
+/// Verifies a quote's Intel signature chain.
 #[async_trait]
-pub trait Collateral: Send + Sync {
-    /// Fetch the Intel collateral that appraises `quote`.
-    async fn fetch(&self, quote: &[u8]) -> Result<QuoteCollateralV3>;
-    /// Seconds since the Unix epoch at which collateral must be valid.
+pub trait QuoteChain: Send + Sync {
+    /// The claims of `quote`, its signature chain verified against Intel
+    /// collateral, and the Unix time it was verified at. That time is read
+    /// after the collateral is fetched and also bounds the appraisal.
     ///
     /// # Errors
     ///
-    /// Returns an error when the clock cannot be read.
-    fn now(&self) -> Result<u64>;
+    /// Returns an error when collateral cannot be fetched, the clock cannot
+    /// be read, or the signature chain does not verify.
+    async fn verify(&self, quote: &[u8]) -> Result<(QuoteClaims, u64)>;
 }
 
 struct Pccs(CollateralClient);
 
 #[async_trait]
-impl Collateral for Pccs {
-    async fn fetch(&self, quote: &[u8]) -> Result<QuoteCollateralV3> {
-        tee_evidence::fetch_collateral(&self.0, quote).await
-    }
-
-    fn now(&self) -> Result<u64> {
-        tee_evidence::unix_now()
+impl QuoteChain for Pccs {
+    async fn verify(&self, quote: &[u8]) -> Result<(QuoteClaims, u64)> {
+        let collateral = tee_evidence::fetch_collateral(&self.0, quote).await?;
+        let now = tee_evidence::unix_now()?;
+        Ok((
+            tee_evidence::verify_signature_chain(quote, collateral, now)?,
+            now,
+        ))
     }
 }
 
@@ -113,16 +120,16 @@ impl Collateral for Pccs {
 pub struct Attestation {
     pub pod: String,
     pub peer: SocketAddr,
-    pub measurements: Measurements,
-    /// UTC keyset deadline, or no additional deadline for legacy evidence.
-    pub keyset_not_after: Option<DateTime<Utc>>,
+    pub measurements: TeeMeasurements,
+    /// UTC deadline of the served keyset; the connection is not used after it.
+    pub keyset_not_after: DateTime<Utc>,
 }
 
 #[derive(Clone)]
 pub struct KubeteeVerifier {
     tls: TlsConnector,
     address: Option<SocketAddr>,
-    collateral: Arc<dyn Collateral>,
+    quote_chain: Arc<dyn QuoteChain>,
     nonce: fn() -> [u8; 32],
     limits: Limits,
     pool: Arc<Pool>,
@@ -158,7 +165,7 @@ impl KubeteeVerifier {
     fn with_parts(
         roots: RootCertStore,
         address: Option<SocketAddr>,
-        collateral: Arc<dyn Collateral>,
+        quote_chain: Arc<dyn QuoteChain>,
         nonce: fn() -> [u8; 32],
         limits: Limits,
     ) -> Self {
@@ -169,7 +176,7 @@ impl KubeteeVerifier {
         Self {
             tls: TlsConnector::from(Arc::new(config)),
             address,
-            collateral,
+            quote_chain,
             nonce,
             limits,
             pool: Arc::new(Pool::new(limits.pool_limits())),
@@ -230,8 +237,8 @@ impl KubeteeVerifier {
         Ok(Response::from_parts(parts, Body::new(body)))
     }
 
-    /// The upstream model list, narrowed to [`TARGETS`], [`IMAGE_MODELS`] and
-    /// [`VIDEO_MODELS`], fetched on an attested connection.
+    /// The upstream model list, narrowed to [`TARGETS`] and [`IMAGE_MODELS`],
+    /// fetched on an attested connection.
     ///
     /// # Errors
     ///
@@ -287,7 +294,7 @@ impl KubeteeVerifier {
             driver: connection.driver,
             attested_at,
             idle_since: None,
-            expires_at: attestation.keyset_not_after,
+            expires_at: Some(attestation.keyset_not_after),
             requests: 0,
         };
         // Fresh connections need the same final check as pooled ones: the
@@ -352,37 +359,49 @@ impl KubeteeVerifier {
         .await
         .context("KubeTEE attestation fetch timed out")??;
         // Keyset deadlines use UTC wall time throughout their lifetime.
-        // Collateral::now is only the quote appraisal clock (historical in
+        // QuoteChain's time is only the quote appraisal clock (historical in
         // offline fixtures), not a clock for live connection reuse.
         let binding =
             evidence::BindingGuard::run(&body, &nonce, connection.leaf.as_ref(), Utc::now())
-                .context("kubetee.attestation.v1 binding")?;
+                .context("kubetee.attestation.v2 binding")?;
         let payload: AttestationPayload =
             serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
-        let quote =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.quote)
-                .context("decode KubeTEE quote")?;
-        let collateral = self.collateral.fetch(&quote).await?;
-        let now = self.collateral.now()?;
-        let claims = tee_evidence::verify_signature_chain(&quote, collateral, now)?;
-        let measurements = evidence::verify_attestation_bound(
-            &payload,
-            &nonce,
-            connection.leaf.as_ref(),
-            &claims,
-            now,
-            binding.as_ref().map(|binding| binding.report_data),
-        )?;
-        if let Some(binding) = &binding {
-            binding.ensure_current(Utc::now())?;
-        }
+        let root: Value =
+            serde_json::from_slice(&body).context("decode KubeTEE attestation response")?;
+        // Dispatch on the TEE that produced the hardware evidence (AMD SEV-SNP
+        // `evidence.snp` vs an Intel TDX `quote`); the classifier fails closed
+        // on any inconsistency.
+        let measurements =
+            match evidence::evidence_tee(&root).context("kubetee.attestation.v2 evidence shape")? {
+                evidence::EvidenceTee::Snp {
+                    snp,
+                    quote_report_data,
+                } => evidence::verify_attestation_snp(
+                    &payload,
+                    &snp,
+                    quote_report_data.as_deref(),
+                    &nonce,
+                    &binding,
+                )
+                .context("kubetee.attestation.v2 SNP evidence")?,
+                evidence::EvidenceTee::Tdx { quote } => {
+                    let tdx_quote =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &quote)
+                            .context("decode KubeTEE quote")?;
+                    let (claims, now) = self.quote_chain.verify(&tdx_quote).await?;
+                    TeeMeasurements::Tdx(evidence::verify_attestation(
+                        &payload, &nonce, &claims, now, &binding,
+                    )?)
+                }
+            };
+        binding.ensure_current(Utc::now())?;
         evidence::log_attested(&payload.pod, &measurements);
         Ok((
             Attestation {
                 pod: payload.pod,
                 peer: connection.peer,
                 measurements,
-                keyset_not_after: binding.map(|binding| binding.not_after),
+                keyset_not_after: binding.not_after,
             },
             attested_at,
         ))
@@ -418,8 +437,8 @@ async fn read_models(
     Ok(Response::from_parts(parts, Body::from(served)))
 }
 
-/// The upstream model list with every entry outside [`TARGETS`],
-/// [`IMAGE_MODELS`] and [`VIDEO_MODELS`] removed.
+/// The upstream model list with every entry outside [`TARGETS`] and
+/// [`IMAGE_MODELS`] removed.
 #[must_use]
 pub fn served_targets(list: &Value) -> Value {
     let data = list
@@ -429,11 +448,10 @@ pub fn served_targets(list: &Value) -> Value {
             models
                 .iter()
                 .filter(|model| {
-                    model.get("id").and_then(Value::as_str).is_some_and(|id| {
-                        TARGETS.contains(&id)
-                            || IMAGE_MODELS.contains(&id)
-                            || VIDEO_MODELS.contains(&id)
-                    })
+                    model
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| TARGETS.contains(&id) || IMAGE_MODELS.contains(&id))
                 })
                 .cloned()
                 .collect::<Vec<_>>()

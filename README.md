@@ -16,8 +16,13 @@ both present. Azure Responses is unqualified because its echo is the deployment 
 Bedrock Mantle accepts models listed in the fixed network-selected registry binding snapshot
 in `us-east-1`; it requires the `bedrock-mantle-model-bindings-v1` approved image feature and
 the selected binding's row revision. The measured adapter validates the raw provider response
-identity, then canonicalizes the response model before releasing content. Older images and
-unadmitted models remain unavailable. Direct Anthropic/OpenAI routes use
+identity, then canonicalizes the response model before releasing content. Its request checks
+keep the 20 MiB body limit and require a strict duplicate-key-free top-level JSON object, the
+bound model id and optional boolean `stream`. It rewrites only the model and lets Bedrock
+validate every other body field. It forwards one optional validated `anthropic-beta` header
+unchanged; other buyer headers are not forwarded. The adapter supplies the worker credential
+and fixed protocol headers. Older images and unadmitted models remain
+unavailable. Direct Anthropic/OpenAI routes use
 verified key slots enforced by the miner runtime. The `gmcli` tool
 handles the full operator lifecycle from your laptop.
 
@@ -32,7 +37,7 @@ handles the full operator lifecycle from your laptop.
 
 Three steps to a running miner.
 
-1. **Install the Phala CLI** (the miner deploys to Phala Cloud) and have a funded account:
+1. **Install Phala CLI 1.2.1 or newer** (the miner deploys to Phala Cloud) and have a funded account:
 
    ```sh
    npm i -g phala
@@ -41,6 +46,8 @@ Three steps to a running miner.
 
    A new miner needs a funded Phala Cloud account — sign up at <https://cloud.phala.network> and
    create an API key (Dashboard → API Keys).
+
+   New CVMs use the `dstack-0.6.5` OS image, manifest v3, and an ephemeral data disk.
 
 2. **Install gmcli:**
 
@@ -157,7 +164,7 @@ instead buyer-visible products. Engy's `deepseek-v4.1-flash` is a source route f
 the canonical `deepseek-v4.1-flash` buyer product. KubeTEE's chat routes serve the
 `-tee` buyer products `zai/glm-5.2-tee`, `zai/glm-5.3-tee`, `zai/glm-5.3-flash-tee`,
 `deepseek/deepseek-v4.1-flash-tee`, `deepseek/deepseek-v4.1-flash-1017-tee`,
-`mistral/mistral-large-4-tee`, `ornith/ornith-1.5-397b-tee` and
+`moonshot/kimi-k3-tee`, `moonshot/kimi-k3.1-pro-tee` and
 `xiaomi/mimo-v2.6-pro-ultraspeed-tee`, and their ordinary siblings through the
 catalog's explicit links. The precise model ids are listed in the
 [miner model sourcing matrix](docs/provider-model-support.md). One model can have several such
@@ -259,6 +266,10 @@ incompatible explicit version/image selections fail at this preflight too.
 
 Deploy creates a Phala Cloud CVM, verifies the deployed image hashes against the registry's
 approved versions, and registers the worker — all in one step.
+
+New workers created by `gmcli deploy` and `gmcli worker add` use the registry's default Phala KMS
+contract. Pass `--kms-contract-id <id>` to either command to choose another non-expiring KMS
+contract listed by the registry.
 
 `gmcli deploy` and `gmcli worker add` support the registry-attested `tdx.small` (1 vCPU / 2 GiB)
 and `tdx.medium` (2 vCPU / 4 GiB, the default) sizes.
@@ -386,18 +397,43 @@ use `gmcli worker add` with a distinct `--app-name`:
 gmcli worker add --app-name gm-miner-2
 ```
 
-List all workers:
+List all workers, with the image version each one runs and whether the registry still
+supports it:
 
 ```sh
 gmcli worker list
 ```
 
-Deregister a worker (does not tear down the Phala CVM — run `phala cvms delete <app_id>`
-separately):
+Each worker gets an `image` line such as `v0.5.22 (supported)`,
+`v0.5.21 (deprecated — grace ends epoch 26273)` or `v0.5.11 (revoked)`. A deprecated image keeps
+serving until its grace epoch; a revoked one is not routed. `unknown image (compose <hash>)` means the registry has no record of that
+image; `not reported yet` means the worker has not reported its compose hash yet.
+`standing ambiguous` means the registry has published that compose hash under more than one OS
+image with different standings, and the worker list does not say which OS image the worker runs.
+
+Remove a worker. This deregisters it from the registry, drops its local record, and then
+deletes its Phala CVM with `phala cvms delete <app_id>`, using the same Phala credentials as
+`deploy` (`--phala-api-key`, `PHALA_API_KEY` / `PHALA_CLOUD_API_KEY`, the saved key, or your
+`phala` CLI login):
 
 ```sh
 gmcli worker remove <worker_id>
 ```
+
+Pass `--keep-cvm` to deregister only and leave the CVM running; the command prints the
+`phala cvms delete` to run later. Without it, the command first checks that the `phala` CLI is
+installed and that Phala Cloud accepts your credential (`phala whoami`), and stops before
+changing anything if not. The CVM is never touched if the registry refuses the deregistration.
+A CVM Phala Cloud reports as not found counts as deleted. If the delete fails, or gmcli has no
+`app_id` recorded for the worker, the worker stays deregistered, the command prints the
+`phala cvms delete` to run yourself, and exits non-zero. If the local record cannot be saved
+after deregistration, the CVM is still deleted and the command reports both outcomes and exits
+non-zero.
+
+`<worker_id>` can also be the `app_id` or `--app-name` of a deploy that launched a CVM but
+never registered; that record is dropped locally and its CVM deleted the same way. A deploy
+that stopped before Phala reported an `app_id` leaves a record gmcli cannot delete a CVM for;
+discard it with `--keep-cvm` and check `phala cvms list` for a CVM under that name.
 
 ## Command reference
 
@@ -425,8 +461,8 @@ gmcli worker remove <worker_id>
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
-| `gmcli worker list` | List workers with per-worker status and last attestation |
-| `gmcli worker remove` | Deregister a worker from the registry |
+| `gmcli worker list` | List workers with per-worker status, last attestation, and image version (supported, deprecated with its grace epoch, or revoked) |
+| `gmcli worker remove` | Deregister a worker and delete its Phala CVM (`--keep-cvm` keeps it) |
 
 All commands accept `--network testnet|mainnet` (default: mainnet). The selection is sticky:
 pass it once and every later command targets it until you pass a different one. `--testnet` is

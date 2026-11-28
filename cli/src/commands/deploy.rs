@@ -13,19 +13,20 @@ use gm_miner_cli::{
     client::{RegistryClient, UPSTREAM_MODEL_ECHO_CAPABILITY},
     cloud_policy::{cloud_fence_required_for_image_recovery, cloud_fence_required_for_worker},
     config::{self, Config, WorkerRecord},
-    dependency::{ensure_dependency, PHALA},
+    dependency::{check_dependency_presence, ensure_dependency, PHALA},
     deploy::{
-        fetch_supported_versions, format_created_at, normalize_hash, parse_phala_cvm_detail,
-        parse_phala_cvm_endpoint, parse_phala_cvm_name, preflight_phala_cli, prepare_deploy_target,
-        resolve_image_source, resolve_registry_credentials, select_version,
-        to_ratls_passthrough_endpoint, verify_hashes, ImageProvisioner, ImageSource, ImageVersion,
-        PhalaClient, PHALA_ENDPOINT_FIELD,
+        delete_phala_cvm, fetch_all_versions, fetch_supported_versions, format_created_at,
+        normalize_hash, parse_phala_cvm_detail, parse_phala_cvm_endpoint, parse_phala_cvm_name,
+        prepare_deploy_target, resolve_image_source, resolve_kms_root,
+        resolve_registry_credentials, select_version, to_ratls_passthrough_endpoint, verify_hashes,
+        CvmDeletion, ImageProvisioner, ImageSource, ImageVersion, KmsRoot, PhalaClient,
+        PHALA_ENDPOINT_FIELD,
     },
     node_secret, slots, terms,
     types::{
         MinerStatus, WorkerCreateRequest, WorkerCreateResponse, WorkerEntry, WorkerListResponse,
     },
-    workers::{is_secondary_live, worker_health_lines},
+    workers::{is_secondary_live, worker_detail_lines},
 };
 
 use crate::commands::persist::{
@@ -49,6 +50,7 @@ pub(crate) struct DeployArgs {
     pub(crate) image_tag: String,
     pub(crate) instance_type: String,
     pub(crate) disk_size: String,
+    pub(crate) kms_contract_id: Option<String>,
     pub(crate) repo_root: Option<std::path::PathBuf>,
     pub(crate) version: Option<usize>,
     pub(crate) boot_timeout_secs: u64,
@@ -108,6 +110,7 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         image_tag: flags.image_tag,
         instance_type: flags.instance_type.as_str().to_owned(),
         disk_size: flags.disk_size,
+        kms_contract_id: flags.kms_contract_id,
         repo_root: flags.repo_root,
         version: flags.version,
         boot_timeout_secs: flags.boot_timeout_secs,
@@ -115,6 +118,12 @@ pub(crate) fn deploy_args_from_flags(flags: DeployFlags) -> DeployArgs {
         assume_yes: flags.yes,
         accept_terms: flags.accept_terms,
     }
+}
+
+/// Shared test fixture built from the command-line defaults.
+#[cfg(test)]
+pub(crate) fn default_test_deploy_args() -> DeployArgs {
+    deploy_args_from_flags(default_deploy_flags())
 }
 
 /// Build and run the deploy subcommand from parsed CLI arguments.
@@ -125,6 +134,11 @@ pub(crate) async fn cmd_deploy_subcommand(
     args: DeployArgs,
     registration: WorkerRegistration,
 ) -> Result<()> {
+    let mut client = RegistryClient::new(cfg.clone());
+    // Resolve the contract before Phala's interactive key prompt and credit
+    // check. A registry that cannot authorize a KMS root should fail without
+    // asking the operator to paste credentials or querying their balance.
+    let kms_root = resolve_kms_root(&client, args.kms_contract_id.as_deref()).await?;
     // Phala gate: ensure the CLI is installed and resolve+validate the API key
     // before building the client. The key is scoped onto the `phala`
     // subprocesses via the client (never the global env), so it never reaches
@@ -138,8 +152,7 @@ pub(crate) async fn cmd_deploy_subcommand(
         gm_miner_cli::deploy::DEFAULT_OS_IMAGE.to_owned(),
     )
     .with_api_key(phala_api_key);
-    let mut client = RegistryClient::new(cfg.clone());
-    cmd_deploy(&cfg, &mut client, &phala, &args, &registration).await
+    cmd_deploy_with_kms(&cfg, &mut client, &phala, &args, &registration, kms_root).await
 }
 
 /// `gmcli worker add` — attach a new CVM to the existing hotkey.
@@ -190,14 +203,14 @@ pub(crate) async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> 
         // A provisional record with a real app_id is a CVM that launched but
         // whose registry POST never landed. Re-running `worker add` would
         // deploy a *second* CVM and orphan the first. Point the operator at
-        // `worker remove`, which clears the local record (and names the CVM to
-        // tear down), so the retry starts clean.
+        // `worker remove`, which clears the local record and deletes that CVM,
+        // so the retry starts clean.
         if !existing.app_id.is_empty() {
             bail!(
                 "worker '{}' has a CVM ({}) that was deployed but never \
                  registered. `worker add` would launch a second CVM and orphan \
                  it. Clear the stale record first:\n  gmcli worker remove {}\n\
-                 (it prints the `phala cvms delete` to run), then re-run \
+                 (which also deletes that CVM), then re-run \
                  `gmcli worker add --app-name {}`.",
                 args.app_name,
                 existing.app_id,
@@ -208,12 +221,16 @@ pub(crate) async fn cmd_worker_add(cfg: Config, args: DeployArgs) -> Result<()> 
         // An empty-app_id provisional stub that belongs to `deploy` (a primary
         // attempt, flag unset) must not be retried through `worker add` — that
         // would reuse worker #1's in-flight secret as a secondary. Send it back
-        // to `deploy`. Only a provisional *secondary* stub retries here.
+        // to `deploy`. Only a provisional *secondary* stub retries here. The
+        // stub has no app_id, so `worker remove` cannot delete a CVM by ID:
+        // `--keep-cvm` discards it cleanly and names the CVM to look for.
         if !existing.provisional_secondary {
             bail!(
                 "'{}' is an in-flight worker #1 deploy, not a secondary worker; \
                  retry it with `gmcli deploy --app-name {}`, or \
-                 `gmcli worker remove {}` to discard the stub",
+                 `gmcli worker remove {} --keep-cvm` to discard the stub \
+                 (check `phala cvms list` for a CVM named '{}')",
+                args.app_name,
                 args.app_name,
                 args.app_name,
                 args.app_name
@@ -392,8 +409,9 @@ async fn fetch_live_workers(client: &mut RegistryClient) -> Result<Vec<WorkerEnt
 /// build and the provider keys have been staged. Catching it up front turns
 /// that into one actionable instruction.
 ///
-/// gmcli never deletes the CVM itself: the delete destroys a running worker and
-/// its encrypted env, so it stays the operator's explicit act.
+/// The preflight never deletes the colliding CVM: it may be a running worker,
+/// and the delete destroys it and its encrypted env, so it stays the
+/// operator's explicit act.
 pub(crate) fn reject_existing_cvm(app_name: &str, existing_app_id: Option<&str>) -> Result<()> {
     let Some(app_id) = existing_app_id else {
         return Ok(());
@@ -449,26 +467,17 @@ async fn phala_preflight(args: &DeployArgs) -> Result<Option<String>> {
 
 /// Whether the deploy target is a slot-capable image.
 ///
-/// Capability comes from the registry rows' publish-time feature stamps:
-/// the selected approved row on the default path, or — when the operator
-/// passes an explicit `--image-ref` — whichever approved row published
-/// that exact digest. An image the registry cannot vouch for (an unknown
-/// ref, or any `--image-repo` build) is treated as legacy: slots are
-/// never advertised for an entrypoint without a stamped row, which also
-/// keeps a multi-key env from ever reaching a CVM that cannot parse it.
-fn image_is_slot_capable(
-    args: &DeployArgs,
-    approved: &ImageVersion,
-    versions: &[ImageVersion],
-) -> bool {
+/// Capability comes from the supported row matching the selected KMS root
+/// and deployed image measurement. An image the registry cannot vouch for
+/// (or a local build without an approved row) is treated as legacy so a
+/// multi-key env cannot reach an entrypoint without slot support.
+fn image_is_slot_capable(args: &DeployArgs, approved: &ImageVersion) -> bool {
     // Mirrors `resolve_image_source` precedence exactly: an explicit
     // --image-ref wins over --image-repo, which wins over the approved
     // row's default ref. The capability verdict must describe the image
     // that actually deploys.
     if let Some(explicit) = args.image_ref.as_deref() {
-        return versions
-            .iter()
-            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.slot_capable());
+        return approved.image_ref.as_deref() == Some(explicit) && approved.slot_capable();
     }
     if args.image_repo.is_some() {
         return false;
@@ -476,19 +485,10 @@ fn image_is_slot_capable(
     approved.slot_capable()
 }
 
-/// Whether the image that will actually deploy contains the measured cloud
-/// model binding. Cloud upstreams are refused unless the registry-approved image
-/// row carries this feature, so an old gateway/image combination cannot accept
-/// a cloud slot as if it were a direct worker.
-fn image_is_cloud_binding_capable(
-    args: &DeployArgs,
-    approved: &ImageVersion,
-    versions: &[ImageVersion],
-) -> bool {
+/// Whether the root-matched image row carries the cloud model-binding feature.
+fn image_is_cloud_binding_capable(args: &DeployArgs, approved: &ImageVersion) -> bool {
     if let Some(explicit) = args.image_ref.as_deref() {
-        return versions
-            .iter()
-            .any(|v| v.image_ref.as_deref() == Some(explicit) && v.cloud_binding_capable());
+        return approved.image_ref.as_deref() == Some(explicit) && approved.cloud_binding_capable();
     }
     if args.image_repo.is_some() {
         return false;
@@ -496,14 +496,9 @@ fn image_is_cloud_binding_capable(
     approved.cloud_binding_capable()
 }
 
-/// Whether the exact image that will run has the generic dynamic Bedrock
-/// binding adapter stamp. Generic cloud model-hop support does not authorize
-/// Bedrock.
-fn image_is_bedrock_mantle_capable(
-    args: &DeployArgs,
-    approved: &ImageVersion,
-    versions: &[ImageVersion],
-) -> bool {
+/// Whether the root-matched image row carries the dynamic Bedrock binding
+/// adapter stamp. Generic cloud model-hop support does not authorize Bedrock.
+fn image_is_bedrock_mantle_capable(args: &DeployArgs, approved: &ImageVersion) -> bool {
     if (args.image_ref.is_none() && args.image_repo.is_some())
         || approved.status != "supported"
         || !approved.bedrock_mantle_model_bindings_capable()
@@ -526,26 +521,9 @@ fn image_is_bedrock_mantle_capable(
     }
     let compose_hash = normalize_hash(&approved.compose_hash);
     let os_hash = normalize_hash(&approved.os_image_hash);
-    if ![&compose_hash, &os_hash]
+    [&compose_hash, &os_hash]
         .iter()
         .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
-        return false;
-    }
-    // Capabilities belong to the same measurements checked before deployment.
-    let mut matching = versions
-        .iter()
-        .filter(|version| {
-            normalize_hash(&version.compose_hash) == compose_hash
-                && normalize_hash(&version.os_image_hash) == os_hash
-        })
-        .peekable();
-    matching.peek().is_some()
-        && matching.all(|version| {
-            version.status == "supported"
-                && version.bedrock_mantle_model_bindings_capable()
-                && version.image_ref.as_deref() == Some(image_ref)
-        })
 }
 
 /// Keep every worker registration path behind the registry's authoritative
@@ -625,12 +603,25 @@ fn resolve_and_render_target(
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn cmd_deploy(
     cfg: &Config,
     client: &mut RegistryClient,
     phala: &dyn PhalaClient,
     args: &DeployArgs,
     registration: &WorkerRegistration,
+) -> Result<()> {
+    let kms_root = resolve_kms_root(client, args.kms_contract_id.as_deref()).await?;
+    cmd_deploy_with_kms(cfg, client, phala, args, registration, kms_root).await
+}
+
+async fn cmd_deploy_with_kms(
+    cfg: &Config,
+    client: &mut RegistryClient,
+    phala: &dyn PhalaClient,
+    args: &DeployArgs,
+    registration: &WorkerRegistration,
+    kms_root: KmsRoot,
 ) -> Result<()> {
     let keys = deploy_preflight(cfg, client, phala, args, registration).await?;
     let worker_backends = keys.worker_backends();
@@ -645,38 +636,42 @@ pub(crate) async fn cmd_deploy(
     let registry_url = cfg.api_url();
     println!("Fetching approved image versions from {registry_url} ...");
     let versions = fetch_supported_versions(&registry_url).await?;
-    let approved = select_version(&versions, args.version)?;
+    let release = select_version(&versions, args.version)?;
     println!(
         "Selected version {}  ({})",
-        approved.notes.as_deref().unwrap_or("<no notes>"),
-        format_created_at(&approved.created_at)
+        release.notes.as_deref().unwrap_or("<no notes>"),
+        format_created_at(&release.created_at)
     );
-    if !worker_backends.is_empty() && !image_is_cloud_binding_capable(args, approved, &versions) {
+    let target = resolve_and_render_target(cfg, args, release.image_ref.as_deref())?;
+    // Reject incompatible templates/images before creating a billable CVM.
+    let expected = gm_miner_cli::deploy::DstackDeployResult {
+        compose_sha256: gm_miner_cli::compose_hash::compute_compose_hash(
+            &target.image_ref,
+            cfg.resolved_network(),
+            kms_root.key_provider_id()?,
+        )?,
+        os_image_hash: gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH.to_owned(),
+    };
+    // Feature stamps are bound to measured hashes, so use the row for this
+    // image and KMS root before making capability decisions.
+    let root_approved = approved_version_for_root(&versions, &expected, &target.image_ref)?;
+    if !worker_backends.is_empty() && !image_is_cloud_binding_capable(args, root_approved) {
         anyhow::bail!(
             "cloud upstreams require a registry-approved image with the `upstream-model-hop` \
              feature; select an image with cloud model binding or wait for this image to be admitted"
         );
     }
     let bedrock_policy_image_capable =
-        require_bedrock_policy_image(&worker_backends, args, approved, &versions)?;
-    let target = resolve_and_render_target(cfg, args, approved.image_ref.as_deref())?;
-    // Reject incompatible templates/images before creating a billable CVM.
-    let expected = gm_miner_cli::deploy::DstackDeployResult {
-        compose_sha256: gm_miner_cli::compose_hash::compute_compose_hash(
-            &target.image_ref,
-            cfg.resolved_network(),
-        )?,
-        os_image_hash: gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH.to_owned(),
-    };
-    verify_hashes(&expected, approved)
-        .context("bundled deployment template does not match the selected approval; no CVM was created. Use the matching gmcli release")?;
+        require_bedrock_policy_image(&worker_backends, args, root_approved)?;
+    verify_hashes(&expected, root_approved)
+        .context("bundled deployment template does not match the selected KMS root approval; no CVM was created. Use the matching gmcli release")?;
     let mut record = prepare_worker_record(
         cfg,
         args,
         registration,
         WorkerRecordInput {
             keys,
-            slot_capable: image_is_slot_capable(args, approved, &versions),
+            slot_capable: image_is_slot_capable(args, root_approved),
             backends: worker_backends,
         },
     )?;
@@ -687,6 +682,7 @@ pub(crate) async fn cmd_deploy(
         args.boot_timeout_secs
     );
     let actual = phala.deploy(
+        kms_root.contract_id()?,
         &target.rendered_compose,
         keys,
         &record.node_secret,
@@ -697,7 +693,7 @@ pub(crate) async fn cmd_deploy(
     record.app_id.clone_from(&actual.app_id);
     persist_worker_record(cfg.active_network(), record.clone())?;
     println!("Verifying hashes against registry approval ...");
-    let verified = verify_hashes(&actual.hashes, approved)?;
+    let verified = verify_hashes(&actual.hashes, root_approved)?;
     println!("  compose_hash  : OK ({})", verified.compose_sha256);
     println!("  os_image_hash : OK ({})", verified.os_image_hash);
     println!("Registering worker with the registry ...");
@@ -732,9 +728,8 @@ fn require_bedrock_policy_image(
     worker_backends: &std::collections::BTreeMap<String, String>,
     args: &DeployArgs,
     approved: &gm_miner_cli::deploy::ImageVersion,
-    versions: &[gm_miner_cli::deploy::ImageVersion],
 ) -> Result<bool> {
-    let capable = image_is_bedrock_mantle_capable(args, approved, versions);
+    let capable = image_is_bedrock_mantle_capable(args, approved);
     if worker_backends
         .get("anthropic")
         .is_some_and(|backend| backend == "bedrock")
@@ -746,6 +741,30 @@ fn require_bedrock_policy_image(
         );
     }
     Ok(capable)
+}
+
+/// Find the supported release row whose measured pair was computed for the
+/// selected KMS root and image reference.
+fn approved_version_for_root<'a>(
+    versions: &'a [ImageVersion],
+    expected: &gm_miner_cli::deploy::DstackDeployResult,
+    image_ref: &str,
+) -> Result<&'a ImageVersion> {
+    let compose_hash = normalize_hash(&expected.compose_sha256);
+    let os_image_hash = normalize_hash(&expected.os_image_hash);
+    versions
+        .iter()
+        .find(|version| {
+            version.status == "supported"
+                && normalize_hash(&version.compose_hash) == compose_hash
+                && normalize_hash(&version.os_image_hash) == os_image_hash
+                && version.image_ref.as_deref() == Some(image_ref)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the local gmcli compose template does not match any approved release for the chosen KMS root. Update gmcli or choose a supported --version. No CVM was created"
+            )
+        })
 }
 
 async fn deploy_preflight<'a>(
@@ -906,7 +925,7 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
     }
 
     // Recovery must not block on an interactive dependency-install prompt.
-    preflight_phala_cli()?;
+    check_dependency_presence(&PHALA)?;
 
     let out = registered_cvm_detail(app_id, phala_key.as_deref())?;
 
@@ -981,10 +1000,9 @@ pub(crate) async fn cmd_register_image_subcommand(cfg: Config, app_id: &str) -> 
 }
 
 fn registered_cvm_detail(app_id: &str, phala_key: Option<&str>) -> Result<std::process::Output> {
-    let out = gm_miner_cli::deploy::phala_command(phala_key)
-        .args(["cvms", "get", app_id, "--json"])
-        .output()
-        .context("run phala cvms get — is the phala CLI installed? (npm i -g phala)")?;
+    let mut command = gm_miner_cli::deploy::phala_command(phala_key)?;
+    command.args(["cvms", "get", app_id, "--json"]);
+    let out = gm_miner_cli::deploy::phala_output(&mut command, "run phala cvms get")?;
     if !out.status.success() {
         bail!(
             "phala cvms get {app_id} failed: {}",
@@ -1080,57 +1098,65 @@ async fn register_image_context(
     })
 }
 
-/// `gmcli publish-image-version` — compute a released image's `ImageVersion`
-/// offline and publish it to the target network's registry allow-list.
+/// `gmcli publish-image-version` — compute and publish one release row for
+/// each non-expiring KMS root on the selected network.
 ///
-/// Renders the compose for the network around the digest-pinned image ref,
-/// computes `compose_hash` from the canonical `app_compose` serialization and
-/// `os_image_hash` from the pinned OS image (no Phala Cloud deploy, no spend),
-/// then POSTs the pair to the network's `/admin/image-versions` upsert
-/// (idempotent). Authenticated by the registry admin key only.
+/// Each compose hash uses the root's CA public key as `key_provider_id`; all
+/// rows use the pinned `dstack-0.6.5` OS image hash. The command posts each
+/// pair to `/admin/image-versions` using the registry admin key.
 pub(crate) async fn cmd_publish_image_version(
     cfg: &Config,
     flags: PublishImageVersionFlags,
 ) -> Result<()> {
     use gm_miner_cli::compose_hash::{compute_compose_hash, PINNED_OS_IMAGE_HASH};
+    use gm_miner_cli::deploy::fetch_approved_kms_roots;
     use gm_miner_cli::image_version::{
-        build_admin_request, post_admin_image_version, registry_url_for, GitProvenance,
+        build_admin_request, post_admin_image_version, GitProvenance,
     };
 
     let network = cfg.resolved_network();
-    let registry_url = registry_url_for(network, cfg.api_url_override.as_deref());
+    let registry_url = cfg.api_url();
+    let mut registry_config = cfg.clone();
+    registry_config.api_url_override = Some(registry_url.clone());
+    let registry_client = RegistryClient::new(registry_config);
+    let kms_roots = fetch_approved_kms_roots(&registry_client).await?;
 
     println!(
-        "Computing the {network} ImageVersion for {} offline ...",
+        "Computing {network} ImageVersions for {} offline ...",
         flags.image_ref
     );
-    let compose_hash = compute_compose_hash(&flags.image_ref, network)?;
     let os_image_hash = PINNED_OS_IMAGE_HASH;
-    println!("  compose_hash  : {compose_hash}");
-    println!("  os_image_hash : {os_image_hash}");
 
     let provenance = GitProvenance {
         tag: flags.git_tag.clone(),
         commit: flags.git_commit.clone(),
         repo: Some(flags.git_repo.clone()),
     };
-    let body = build_admin_request(
-        &compose_hash,
-        os_image_hash,
-        &flags.image_ref,
-        network,
-        &provenance,
-    );
+    for kms_root in kms_roots {
+        let compose_hash =
+            compute_compose_hash(&flags.image_ref, network, kms_root.key_provider_id()?)?;
+        let body = build_admin_request(
+            &compose_hash,
+            os_image_hash,
+            &flags.image_ref,
+            network,
+            &provenance,
+        );
 
-    println!(
-        "Publishing to {registry_url}{} ...",
-        gm_miner_cli::image_version::ADMIN_IMAGE_VERSIONS_PATH
-    );
-    let action = post_admin_image_version(&registry_url, &flags.registry_admin_key, &body).await?;
-    println!(
-        "  {action}: compose_hash={} os_image_hash={}",
-        body.compose_hash, body.os_image_hash
-    );
+        println!("  KMS contract: {}", kms_root.contract_id()?);
+        println!("  compose_hash  : {}", body.compose_hash);
+        println!("  os_image_hash : {}", body.os_image_hash);
+        println!(
+            "Publishing to {registry_url}{} ...",
+            gm_miner_cli::image_version::ADMIN_IMAGE_VERSIONS_PATH
+        );
+        let action =
+            post_admin_image_version(&registry_url, &flags.registry_admin_key, &body).await?;
+        println!(
+            "  {action}: compose_hash={} os_image_hash={}",
+            body.compose_hash, body.os_image_hash
+        );
+    }
     Ok(())
 }
 
@@ -1180,9 +1206,8 @@ async fn post_register_image(
         provider_slots: args.provider_slots,
     })
     .context("serialize register body")?;
-    // The accepted terms version, recorded on the miner row keyed to hotkey —
-    // the tamper-resistant copy of the local config acceptance. `None` (a
-    // register-image resync) leaves any stored value untouched.
+    // The accepted terms version is recorded on the miner row keyed to
+    // hotkey. `None` (a register-image resync) leaves any stored value unchanged.
     if let Some(version) = args.accepted_terms_version {
         body["accepted_terms_version"] = serde_json::Value::String(version.to_owned());
     }
@@ -1299,17 +1324,34 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
     }
     println!("\n{} worker(s) total.", list.workers.len());
 
+    // A display aid: the list is still worth printing when the roster is not.
+    let versions = match fetch_all_versions(&client.config.api_url()).await {
+        Ok(versions) => Some(versions),
+        Err(err) => {
+            eprintln!("warning: could not look up image versions: {err:#}");
+            None
+        }
+    };
     let now = Utc::now();
     for w in &list.workers {
-        for line in worker_health_lines(w, list.consecutive_ok_required, now) {
+        for line in worker_detail_lines(w, versions.as_deref(), list.consecutive_ok_required, now) {
             println!("{line}");
         }
     }
     Ok(())
 }
 
-/// `gmcli worker remove <id>` — deregister a worker and remind the
-/// operator to tear down its Phala CVM separately.
+/// What `worker remove` does with the worker's Phala CVM.
+pub(crate) enum CvmTeardown {
+    /// `--keep-cvm`: leave the CVM running and print the delete command.
+    Keep,
+    /// Delete the CVM with `phala cvms delete`, scoping this key onto the
+    /// subprocess (`None` uses the `phala` CLI login session).
+    Delete { phala_api_key: Option<String> },
+}
+
+/// `gmcli worker remove <id>` — deregister a worker, drop its local record,
+/// then delete its Phala CVM (unless `--keep-cvm`).
 ///
 /// `id` is the registry `worker_id` for a registered worker. It also accepts
 /// the local `app_id` or `app_name` of a *provisional* record — a deploy that
@@ -1317,7 +1359,14 @@ pub(crate) async fn cmd_worker_list(client: &mut RegistryClient) -> Result<()> {
 /// provisional record is only local state, so it is dropped without a registry
 /// DELETE; this clears the dead-end that otherwise blocks re-running `worker
 /// add` for that name.
-pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
+///
+/// When the CVM will be deleted, [`preflight_cvm_delete`] first checks for the
+/// `phala` CLI and a Phala credential, so a missing one fails before anything
+/// changes. The CVM is touched only after the registry DELETE succeeds. A CVM that
+/// cannot be deleted (or whose `app_id` is not tracked) is an error after the
+/// deregistration has been recorded, so the command exits non-zero with the
+/// `phala cvms delete` to run.
+pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str, cvm: CvmTeardown) -> Result<()> {
     let network = cfg.active_network().to_owned();
     let tracked = cfg.active_network_entry().and_then(|n| {
         n.worker_by_id(id)
@@ -1325,11 +1374,28 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
             .or_else(|| n.worker_by_app_name(id))
     });
 
-    if tracked.is_some_and(|w| w.worker_id.is_empty()) {
-        return remove_provisional_worker(&network, id);
+    let tracked_app_id = tracked.and_then(|w| non_empty_app_id(&w.app_id));
+    if let (CvmTeardown::Delete { phala_api_key }, Some(app_id)) = (&cvm, tracked_app_id) {
+        preflight_cvm_delete(app_id, phala_api_key.as_deref())?;
     }
 
-    let app_id = tracked.map(|w| w.app_id.clone());
+    if tracked.is_some_and(|w| w.worker_id.is_empty()) {
+        let Some(record) = remove_provisional_worker(&network, id)? else {
+            bail!(
+                "worker record '{id}' changed during removal; its CVM was NOT deleted. \
+                 Check `gmcli worker list` and retry removal."
+            );
+        };
+        println!(
+            "Dropped the unregistered worker record for '{}'.",
+            record.app_name
+        );
+        let done = format!("the record for '{}' is dropped", record.app_name);
+        let app_id = non_empty_app_id(&record.app_id);
+        return tear_down_cvm(&cvm, app_id, &record.app_name, &done);
+    }
+
+    let app_id = tracked_app_id.map(str::to_owned);
     let worker_id = tracked.map_or_else(|| id.to_owned(), |w| w.worker_id.clone());
 
     let mut client = RegistryClient::new(cfg);
@@ -1348,23 +1414,109 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
 
     // Drop the local record so `worker list`/re-deploy don't reference a
     // deregistered worker. Locked so a concurrent deploy save can't resurrect it.
-    config::with_config_lock(|| {
+    let dropped = config::with_config_lock(|| {
         let mut cfg = config::load().context("load gmcli config")?;
         cfg.active_network = Some(network);
-        cfg.active_entry_mut().remove_worker_by_id(&worker_id);
-        config::save(&cfg).context("persist worker removal to gmcli config")
-    })?;
+        let dropped = cfg.active_entry_mut().remove_worker_by_id(&worker_id);
+        config::save(&cfg).context("persist worker removal to gmcli config")?;
+        Ok(dropped.is_some())
+    });
 
     println!("Worker {worker_id} deregistered from the registry.");
-    let reminder = match app_id {
-        Some(app_id) => {
-            format!("Now tear down the Phala CVM separately:\n  phala cvms delete {app_id}")
+    let done = format!("worker {worker_id} is deregistered");
+    match dropped {
+        Ok(dropped) => {
+            if dropped {
+                println!("Dropped its local worker record.");
+            }
+            tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done)
         }
-        None => "Now tear down the corresponding Phala CVM separately with \
-             `phala cvms delete <app_id>` (its app_id was not tracked locally)."
-            .to_owned(),
+        // The registry no longer has the worker, so its CVM must still be
+        // torn down; then report both outcomes.
+        Err(persist_err) => {
+            let stale = format!(
+                "its local record could not be dropped and stays in gmcli config: {persist_err:#}"
+            );
+            match tear_down_cvm(&cvm, app_id.as_deref(), "<app_id>", &done) {
+                Ok(()) => bail!("{done}, but {stale}"),
+                Err(teardown_err) => bail!("{teardown_err:#}\n  also, {stale}"),
+            }
+        }
+    }
+}
+
+/// Fail before anything changes when the CVM delete could not run: no `phala`
+/// CLI, or a credential Phala does not accept (`phala whoami` with the
+/// resolved key, or the CLI login session when there is none).
+fn preflight_cvm_delete(app_id: &str, phala_api_key: Option<&str>) -> Result<()> {
+    let skip = "Nothing was changed. Pass --keep-cvm to remove the worker without \
+                deleting its CVM.";
+    check_dependency_presence(&PHALA)
+        .with_context(|| format!("cannot delete Phala CVM {app_id}. {skip}"))?;
+    let source = if phala_api_key.is_some() {
+        "the resolved Phala API key"
+    } else {
+        "the `phala` CLI login session (no API key configured)"
     };
-    println!("{reminder}");
+    gm_miner_cli::phala::check_credential(phala_api_key).with_context(|| {
+        format!(
+            "cannot delete Phala CVM {app_id}: Phala Cloud did not accept {source}.\n  \
+             pass a valid --phala-api-key <key>, set PHALA_API_KEY, or run `phala auth login`.\n  \
+             {skip}"
+        )
+    })
+}
+
+fn non_empty_app_id(app_id: &str) -> Option<&str> {
+    Some(app_id).filter(|id| !id.trim().is_empty())
+}
+
+/// Delete (or, with `--keep-cvm`, keep) the worker's CVM. `done` names what
+/// already succeeded, so a failure says exactly what did and did not happen.
+/// `fallback_id` is what to tell the operator to delete when no `app_id` is
+/// tracked: `<app_id>`, or a provisional record's CVM name (`phala cvms
+/// delete` accepts either).
+fn tear_down_cvm(
+    cvm: &CvmTeardown,
+    app_id: Option<&str>,
+    fallback_id: &str,
+    done: &str,
+) -> Result<()> {
+    let (phala_api_key, app_id) = match (cvm, app_id) {
+        (CvmTeardown::Keep, Some(app_id)) => {
+            println!(
+                "Kept its Phala CVM (--keep-cvm). Delete it when ready:\n  \
+                 phala cvms delete {app_id}"
+            );
+            return Ok(());
+        }
+        (CvmTeardown::Keep, None) => {
+            println!(
+                "No CVM deleted (--keep-cvm). Its app_id is not tracked locally, so gmcli \
+                 cannot tell which CVM it ran on; if `phala cvms list` shows one, delete \
+                 it:\n  phala cvms delete {fallback_id}"
+            );
+            return Ok(());
+        }
+        (CvmTeardown::Delete { .. }, None) => bail!(
+            "{done}, but its Phala CVM was NOT deleted: its app_id is not tracked locally.\n  \
+             find it with `phala cvms list`, then delete it:\n  \
+             phala cvms delete {fallback_id}"
+        ),
+        (CvmTeardown::Delete { phala_api_key }, Some(app_id)) => (phala_api_key.as_deref(), app_id),
+    };
+    match delete_phala_cvm(app_id, phala_api_key) {
+        Ok(CvmDeletion::Deleted) => println!("Deleted Phala CVM {app_id}."),
+        Ok(CvmDeletion::NotFound) => println!(
+            "Phala CVM {app_id} is already gone: Phala Cloud has no such CVM in this account. \
+             Nothing to delete (if it runs under another Phala account, delete it there)."
+        ),
+        Err(err) => bail!(
+            "{done}, but its Phala CVM {app_id} was NOT deleted: {err:#}\n  \
+             delete it yourself:\n  \
+             phala cvms delete {app_id}"
+        ),
+    }
     Ok(())
 }
 
@@ -1376,6 +1528,7 @@ pub(crate) async fn cmd_worker_remove(cfg: Config, id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use gm_miner_cli::config::{NetworkEntry, ProviderKeys};
+    use serde_json::json;
     use std::collections::HashMap;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1410,28 +1563,307 @@ mod tests {
     fn deploy_args() -> DeployArgs {
         DeployArgs {
             app_name: "miner".to_owned(),
-            image_ref: None,
             project_dir: std::path::PathBuf::from("."),
-            image_repo: None,
             image_tag: "latest".to_owned(),
             instance_type: "small".to_owned(),
             disk_size: "30".to_owned(),
-            repo_root: None,
-            version: None,
-            boot_timeout_secs: 300,
-            phala_api_key: None,
             assume_yes: true,
             accept_terms: true,
+            ..super::default_test_deploy_args()
         }
     }
 
+    struct RecordingPhala {
+        deploy_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PhalaClient for RecordingPhala {
+        fn deploy(
+            &self,
+            _kms_contract_id: &str,
+            _compose_yaml: &str,
+            _env_vars: &ProviderKeys,
+            _node_secret: &str,
+            _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
+            _boot_timeout_secs: u64,
+        ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
+            self.deploy_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bail!("reached Phala deployment")
+        }
+
+        fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    fn bedrock_version_rows(
+        image_ref: &str,
+        root_a_compose: &str,
+        root_b_compose: &str,
+        root_b_has_bedrock: bool,
+    ) -> serde_json::Value {
+        let base_features = ["upstream-model-hop", "upstream-key-slots"];
+        let mut root_a_features = base_features.to_vec();
+        let mut root_b_features = base_features.to_vec();
+        if root_b_has_bedrock {
+            root_b_features.push("bedrock-mantle-model-bindings-v1");
+        } else {
+            root_a_features.push("bedrock-mantle-model-bindings-v1");
+        }
+        json!({
+            "versions": [
+                {
+                    "git_tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "compose_hash": root_a_compose,
+                    "os_image_hash": gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH,
+                    "image_ref": image_ref,
+                    "status": "supported",
+                    "created_at": "2026-01-02T00:00:00Z",
+                    "features": root_a_features
+                },
+                {
+                    "git_tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "compose_hash": root_b_compose,
+                    "os_image_hash": gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH,
+                    "image_ref": image_ref,
+                    "status": "supported",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "features": root_b_features
+                }
+            ]
+        })
+    }
+
+    async fn mount_bedrock_registry(server: &MockServer, versions: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/kms-roots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "roots": [
+                    {
+                        "ca_pubkey": "ca-root-a",
+                        "kms_contract_id": "root-a",
+                        "is_default": true,
+                        "allowed_until": null
+                    },
+                    {
+                        "ca_pubkey": "ca-root-b",
+                        "kms_contract_id": "root-b",
+                        "is_default": false,
+                        "allowed_until": null
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "capabilities": [UPSTREAM_MODEL_ECHO_CAPABILITY]
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/image-versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(versions))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn bedrock_deploy_config(server: &MockServer) -> Config {
+        let mut cfg = registry_cfg(server);
+        cfg.provider_keys = Some(ProviderKeys {
+            anthropic_upstream: Some("bedrock".to_owned()),
+            bedrock_region: Some("us-east-1".to_owned()),
+            bedrock_api_key: Some("bedrock-key".to_owned()),
+            ..Default::default()
+        });
+        cfg.active_entry_mut().workers.push(WorkerRecord {
+            worker_id: "existing-worker".to_owned(),
+            app_id: "existing-app".to_owned(),
+            app_name: "miner".to_owned(),
+            node_secret: "test-node-secret-1234".to_owned(),
+            ..Default::default()
+        });
+        cfg
+    }
+
     #[test]
-    fn bedrock_deploy_capability_uses_the_selected_measurement() {
+    fn root_matched_row_supplies_features_for_the_same_release() {
+        let image_ref = "registry.example/gm@sha256:abc";
+        let first_root = ImageVersion {
+            compose_hash: "first-root-compose".to_owned(),
+            git_tag: Some("v0.1.2".to_owned()),
+            os_image_hash: gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH.to_owned(),
+            status: "supported".to_owned(),
+            deprecation_end_epoch: None,
+            notes: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            image_ref: Some(image_ref.to_owned()),
+            features: vec![
+                "upstream-key-slots".to_owned(),
+                "bedrock-mantle-model-bindings-v1".to_owned(),
+            ],
+        };
+        let selected_root = ImageVersion {
+            compose_hash: "selected-root-compose".to_owned(),
+            features: vec!["upstream-model-hop".to_owned()],
+            ..first_root.clone()
+        };
+        let expected = gm_miner_cli::deploy::DstackDeployResult {
+            compose_sha256: "selected-root-compose".to_owned(),
+            os_image_hash: gm_miner_cli::compose_hash::PINNED_OS_IMAGE_HASH.to_owned(),
+        };
+
+        let versions = [first_root, selected_root];
+        let approved = approved_version_for_root(&versions, &expected, image_ref)
+            .expect("the matching KMS root approval is selected");
+
+        assert_eq!(approved.compose_hash, "selected-root-compose");
+        assert_eq!(approved.git_tag.as_deref(), Some("v0.1.2"));
+        assert!(image_is_cloud_binding_capable(&deploy_args(), approved));
+        assert!(!image_is_slot_capable(&deploy_args(), approved));
+        assert!(!image_is_bedrock_mantle_capable(&deploy_args(), approved));
+    }
+
+    #[tokio::test]
+    async fn image_publication_uses_the_configured_registry_for_both_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/kms-roots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "roots": [{
+                    "ca_pubkey": "root-ca",
+                    "kms_contract_id": "registry-default",
+                    "is_default": true,
+                    "allowed_until": null
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "capabilities": [UPSTREAM_MODEL_ECHO_CAPABILITY]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/admin/image-versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "action": "inserted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cfg = Config {
+            active_network: Some("testnet".to_owned()),
+            networks: HashMap::from([(
+                "testnet".to_owned(),
+                NetworkEntry {
+                    api_url: Some(server.uri()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        cmd_publish_image_version(
+            &cfg,
+            PublishImageVersionFlags {
+                image_ref: format!("ghcr.io/taostat/gm-miner@sha256:{}", "a".repeat(64)),
+                registry_admin_key: "test-admin-key".to_owned(),
+                git_tag: Some("v0.1.2".to_owned()),
+                git_commit: None,
+                git_repo: "taostat/gm-miner".to_owned(),
+            },
+        )
+        .await
+        .expect("root discovery and publication use the configured registry");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .any(|request| request.url.path() == "/kms-roots"));
+        assert!(requests
+            .iter()
+            .any(|request| request.url.path() == "/capabilities"));
+        assert!(requests
+            .iter()
+            .any(|request| request.url.path() == "/admin/image-versions"));
+    }
+
+    #[tokio::test]
+    async fn kms_roots_are_fetched_before_the_cvm_creation_flow() {
+        struct UnexpectedCvmCreation;
+
+        impl PhalaClient for UnexpectedCvmCreation {
+            fn deploy(
+                &self,
+                _kms_contract_id: &str,
+                _compose_yaml: &str,
+                _env_vars: &ProviderKeys,
+                _node_secret: &str,
+                _registry_creds: Option<&gm_miner_cli::deploy::RegistryCredentials>,
+                _boot_timeout_secs: u64,
+            ) -> Result<gm_miner_cli::deploy::DeployOutcome> {
+                bail!("CVM creation must not be reached after a KMS roots lookup failure")
+            }
+
+            fn existing_cvm_app_id(&self) -> Result<Option<String>> {
+                Ok(None)
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/kms-roots"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let mut cfg = registry_cfg(&server);
+        cfg.provider_keys = Some(ProviderKeys {
+            anthropic: Some("test-key".to_owned()),
+            ..Default::default()
+        });
+        let mut client = RegistryClient::new(cfg.clone());
+        let error = cmd_deploy(
+            &cfg,
+            &mut client,
+            &UnexpectedCvmCreation,
+            &deploy_args(),
+            &WorkerRegistration::Add {
+                hotkey: "5HK".to_owned(),
+            },
+        )
+        .await
+        .expect_err("an unsupported KMS roots endpoint must stop deployment");
+
+        assert!(error.to_string().contains("/kms-roots"), "{error:#}");
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a KMS roots failure must stop before other deploy work: {requests:?}"
+        );
+        assert_eq!(requests[0].url.path(), "/kms-roots");
+    }
+
+    #[test]
+    fn bedrock_deploy_capability_uses_the_root_matched_measurement() {
         let approved = ImageVersion {
             git_tag: None,
             compose_hash: "a".repeat(64),
             os_image_hash: "b".repeat(64),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
@@ -1443,41 +1875,14 @@ mod tests {
             features: vec!["bedrock-mantle-model-bindings-v1".to_owned()],
             ..approved.clone()
         };
-        let other_os = ImageVersion {
-            os_image_hash: "c".repeat(64),
-            ..current.clone()
-        };
-        assert!(!image_is_bedrock_mantle_capable(
-            &args,
-            &approved,
-            &[approved.clone(), other_os.clone()]
-        ));
+        assert!(!image_is_bedrock_mantle_capable(&args, &approved));
         assert!(require_bedrock_policy_image(
             &std::collections::BTreeMap::from([("anthropic".to_owned(), "bedrock".to_owned())]),
             &args,
             &approved,
-            &[approved.clone(), other_os]
         )
         .is_err());
-        assert!(image_is_bedrock_mantle_capable(
-            &args,
-            &current,
-            std::slice::from_ref(&current)
-        ));
-        assert!(!image_is_bedrock_mantle_capable(
-            &args,
-            &current,
-            &[current.clone(), approved.clone()]
-        ));
-        let older_other_os = ImageVersion {
-            os_image_hash: "c".repeat(64),
-            ..approved
-        };
-        assert!(image_is_bedrock_mantle_capable(
-            &args,
-            &current,
-            &[current.clone(), older_other_os]
-        ));
+        assert!(image_is_bedrock_mantle_capable(&args, &current));
         for invalid in [
             ImageVersion {
                 status: "blocked".to_owned(),
@@ -1496,25 +1901,75 @@ mod tests {
                 ..current.clone()
             },
         ] {
-            assert!(!image_is_bedrock_mantle_capable(
-                &args,
-                &invalid,
-                std::slice::from_ref(&invalid)
-            ));
+            assert!(!image_is_bedrock_mantle_capable(&args, &invalid));
         }
-        assert!(!image_is_bedrock_mantle_capable(&args, &current, &[]));
         args.image_repo = Some("local/image".to_owned());
-        assert!(image_is_bedrock_mantle_capable(
-            &args,
-            &current,
-            std::slice::from_ref(&current)
-        ));
+        assert!(image_is_bedrock_mantle_capable(&args, &current));
         args.image_ref = None;
-        assert!(!image_is_bedrock_mantle_capable(
-            &args,
-            &current,
-            std::slice::from_ref(&current)
-        ));
+        assert!(!image_is_bedrock_mantle_capable(&args, &current));
+    }
+
+    #[tokio::test]
+    async fn deploy_uses_the_selected_root_row_for_bedrock_capability() {
+        for (root_b_has_bedrock, expected_message) in [
+            (false, "Bedrock requires a registry-approved image"),
+            (true, "reached Phala deployment"),
+        ] {
+            let server = MockServer::start().await;
+            let image_ref = format!("docker.io/library/test@sha256:{}", "a".repeat(64));
+            let root_a_compose = gm_miner_cli::compose_hash::compute_compose_hash(
+                &image_ref,
+                gm_miner_cli::network::Network::Testnet,
+                "ca-root-a",
+            )
+            .expect("root A compose measurement");
+            let root_b_compose = gm_miner_cli::compose_hash::compute_compose_hash(
+                &image_ref,
+                gm_miner_cli::network::Network::Testnet,
+                "ca-root-b",
+            )
+            .expect("root B compose measurement");
+            assert_ne!(root_a_compose, root_b_compose);
+            mount_bedrock_registry(
+                &server,
+                bedrock_version_rows(
+                    &image_ref,
+                    &root_a_compose,
+                    &root_b_compose,
+                    root_b_has_bedrock,
+                ),
+            )
+            .await;
+
+            let cfg = bedrock_deploy_config(&server);
+            let mut client = RegistryClient::new(cfg.clone());
+            let mut args = deploy_args();
+            args.kms_contract_id = Some("root-b".to_owned());
+            let phala = RecordingPhala {
+                deploy_calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+
+            let error = cmd_deploy(
+                &cfg,
+                &mut client,
+                &phala,
+                &args,
+                &WorkerRegistration::Add {
+                    hotkey: "5HK".to_owned(),
+                },
+            )
+            .await
+            .expect_err("deployment stops at the expected stage for this root row");
+
+            assert!(error.to_string().contains(expected_message), "{error:#}");
+            assert_eq!(
+                phala
+                    .deploy_calls
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                usize::from(root_b_has_bedrock),
+                "only the root B row with the Bedrock feature reaches Phala deployment"
+            );
+        }
     }
 
     #[test]
@@ -1524,25 +1979,18 @@ mod tests {
             compose_hash: "a".repeat(64),
             os_image_hash: "b".repeat(64),
             status: "supported".to_owned(),
+            deprecation_end_epoch: None,
             notes: None,
             created_at: "2025-01-01T00:00:00Z".to_owned(),
             image_ref: Some("registry.example/miner@sha256:chosen".to_owned()),
             features: vec!["upstream-model-hop".to_owned()],
         };
-        assert!(!image_is_bedrock_mantle_capable(
-            &deploy_args(),
-            &approved,
-            std::slice::from_ref(&approved)
-        ));
+        assert!(!image_is_bedrock_mantle_capable(&deploy_args(), &approved));
 
         approved
             .features
             .push("bedrock-mantle-model-bindings-v1".to_owned());
-        assert!(image_is_bedrock_mantle_capable(
-            &deploy_args(),
-            &approved,
-            std::slice::from_ref(&approved)
-        ));
+        assert!(image_is_bedrock_mantle_capable(&deploy_args(), &approved));
 
         let mut args = deploy_args();
         args.image_ref = Some("registry.example/miner@sha256:chosen".to_owned());
@@ -1551,11 +1999,7 @@ mod tests {
             features: vec!["upstream-model-hop".to_owned()],
             ..approved
         };
-        assert!(!image_is_bedrock_mantle_capable(
-            &args,
-            &explicit_old_image,
-            std::slice::from_ref(&explicit_old_image)
-        ));
+        assert!(!image_is_bedrock_mantle_capable(&args, &explicit_old_image));
     }
 
     #[tokio::test]
@@ -1761,6 +2205,7 @@ mod tests {
     impl PhalaClient for CollidingPhala {
         fn deploy(
             &self,
+            _kms_contract_id: &str,
             _compose_yaml: &str,
             _env_vars: &ProviderKeys,
             _node_secret: &str,
@@ -1781,6 +2226,7 @@ mod tests {
     impl PhalaClient for FreeNamePhala {
         fn deploy(
             &self,
+            _kms_contract_id: &str,
             _compose_yaml: &str,
             _env_vars: &ProviderKeys,
             _node_secret: &str,
@@ -1799,7 +2245,7 @@ mod tests {
     /// `phala deploy` with `A CVM with name '<name>' already exists in this
     /// workspace` — after the image build, with no hint about what to do. The
     /// preflight must catch the collision and name the exact teardown command
-    /// (gmcli never deletes the CVM itself: that destroys a running worker).
+    /// (the preflight never deletes the CVM itself: that destroys a running worker).
     #[test]
     fn an_existing_cvm_name_is_rejected_with_the_delete_command() {
         let err = preflight_cvm_name(&CollidingPhala, "gm-testnet-zai-a")

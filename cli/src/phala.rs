@@ -32,6 +32,20 @@ pub const PHALA_API_KEY_HEADER: &str = "X-API-Key";
 /// Where a miner signs up for (and funds) a Phala Cloud account.
 pub const PHALA_SIGNUP_URL: &str = "https://cloud.phala.network";
 
+/// Keep a relative credential-directory override anchored to the caller when
+/// a Phala subprocess runs in an isolated working directory. Blank overrides
+/// are left alone because Phala treats them as unset.
+pub(crate) fn scope_credentials_dir(command: &mut std::process::Command) -> Result<()> {
+    if let Some(directory) = std::env::var_os("PHALA_CLOUD_DIR") {
+        if !directory.to_string_lossy().trim().is_empty() {
+            let path =
+                std::path::absolute(directory).context("resolve Phala credential directory")?;
+            command.env("PHALA_CLOUD_DIR", path);
+        }
+    }
+    Ok(())
+}
+
 /// `GET /auth/me` response — only the credit balance is consumed here.
 #[derive(Debug, Deserialize)]
 struct PhalaCurrentUser {
@@ -124,6 +138,16 @@ pub fn stored_key(config_key: Option<&str>) -> Option<String> {
     key_from_env().or_else(|| non_empty(config_key).map(str::to_owned))
 }
 
+/// The Phala API key for a `phala` call outside deploy (`worker remove`'s CVM
+/// delete): deploy's precedence — `--phala-api-key` flag, then env, then the
+/// saved config key — without the paste prompt or the credit-balance check,
+/// since deleting a CVM needs no funds. `None` leaves the subprocess on the
+/// `phala` CLI login session.
+#[must_use]
+pub fn non_interactive_key(flag: Option<&str>, config_key: Option<&str>) -> Option<String> {
+    pick_key_source(flag, key_from_env().as_deref(), config_key).map(|source| source.key)
+}
+
 /// Read the Phala API key from the environment, preferring `PHALA_API_KEY`
 /// and falling back to `PHALA_CLOUD_API_KEY` (the var the `phala` CLI itself
 /// honours). Whitespace-only values are ignored.
@@ -172,16 +196,65 @@ pub async fn resolve_key(flag: Option<&str>, assume_yes: bool) -> Result<Option<
     Ok(Some(source.key))
 }
 
+/// Prove a Phala credential works with `phala whoami`, an authenticated
+/// read-only call: with `api_key` scoped onto the subprocess (which takes
+/// precedence over any CLI session), or the CLI login session when `None`.
+///
+/// # Errors
+/// Returns an error carrying Phala's own message when `phala` cannot be run
+/// or rejects the credential.
+pub fn check_credential(api_key: Option<&str>) -> Result<()> {
+    let mut command = crate::deploy::phala_command(api_key)?;
+    command.arg("whoami");
+    let out = crate::deploy::phala_output(&mut command, "run phala whoami")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    let detail = if stderr.is_empty() {
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    } else {
+        stderr
+    };
+    bail!(
+        "`phala whoami` failed: {}",
+        redact_credentials(&detail, api_key)
+    )
+}
+
+/// Subprocess diagnostics can echo the request's API key, including in debug
+/// headers. Session keys are unknown to gmcli, so suppress key headers too.
+pub(crate) fn redact_credentials(message: &str, api_key: Option<&str>) -> String {
+    let message = message
+        .lines()
+        .map(|line| {
+            if line.to_ascii_lowercase().contains("x-api-key") {
+                "[REDACTED API-key header]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => message.replace(key, "[REDACTED]"),
+        None => message,
+    }
+}
+
 /// Whether the `phala` CLI already holds a login session. `phala whoami` exits
 /// non-zero when unauthenticated, so a zero exit means a usable session — the
 /// same probe `gmcli doctor`'s Phala check uses, kept consistent here.
 fn phala_cli_logged_in() -> bool {
-    std::process::Command::new("phala")
+    let Ok(mut command) = crate::deploy::phala_command(None) else {
+        return false;
+    };
+    command
         .arg("whoami")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|status| status.success())
 }
 
 /// A short label for whichever credential source a deploy would use, or `None`
